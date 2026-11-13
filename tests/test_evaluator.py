@@ -31,7 +31,7 @@ def test_recall_at_n():
 
 
 def test_ndcg_at_n():
-    assert ndcg_at_n([1, 2, 3], {1, 3}, 3) == 1.0  # ordem ideal
+    assert ndcg_at_n([1, 3, 2], {1, 3}, 3) == 1.0  # ordem ideal
     v = ndcg_at_n([2, 3, 1], {1, 3}, 3)
     assert 0.0 < v < 1.0
     assert ndcg_at_n([1, 2, 3], set(), 3) == 0.0
@@ -119,6 +119,6 @@ def test_baselines_synthetic():
 
 def test_coverage():
     recs_by_user = {1: [101, 102], 2: [102, 103], 3: [104]}
-    assert coverage(recs_by_user, 4) == 3 / 4
+    assert coverage(recs_by_user, 4) == 4 / 4
     assert coverage(recs_by_user, 10) == 0.4
     assert coverage({}, 5) == 0.0
