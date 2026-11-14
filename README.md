@@ -8,19 +8,31 @@ Sistema de recomendação de jogos (Steam) baseado em TF-IDF + similaridade do c
 - **Frontend**: React — interface de demonstração que consome a API do FastAPI.
 - **Engine de recomendação**: Python (pandas, scikit-learn, numpy, nltk) — TF-IDF + similaridade do cosseno.
 
-## Estrutura
+## Estrutura do Projeto
 
-```
-data/raw/                # Dados brutos da Steam (não versionados)
-data/processed/          # Dados processados (gerados)
-recommender/             # Projeto Python (uv) — Motor de recomendação, avaliação e API
-  ├── src/data/          # Engenharia de dados: carregamento, limpeza, pré-processamento
-  ├── src/models/        # Modelo de recomendação (perfil do usuário, similaridade do cosseno, Top-N)
-  ├── src/evaluation/    # Avaliação: treino/teste, Precision@N, Recall@N, nDCG@N, baselines, cobertura
-  ├── api/               # Backend FastAPI (rotas de recomendação)
-  ├── tests/             # Testes automatizados (pytest)
-  └── pyproject.toml     # Dependências e configuração do projeto Python
-frontend/                # Frontend React (interface de demonstração)
+```text
+O-que-temos-hoje/
+├── data/                        # Diretório de dados (ignorado pelo Git)
+│   ├── raw/                     # Dados brutos da Steam (games.csv, games_metadata.json, users.csv, recommendations.csv)
+│   └── processed/               # Artefatos e matrizes processadas geradas pelo pipeline
+│
+├── recommender/                 # Projeto Python (uv) — Motor de recomendação, avaliação e API
+│   ├── src/
+│   │   ├── data/                # Engenharia de dados: carregamento (loader.py), limpeza (preprocess.py) e pipeline (pipeline.py)
+│   │   ├── models/              # Modelo FBC: perfil do usuário, similaridade do cosseno e ranking Top-N (recommender.py)
+│   │   ├── evaluation/          # Avaliação experimental: treino/teste, Precision@N, Recall@N, nDCG@N, baselines e cobertura (evaluator.py)
+│   │   └── api/                 # Backend FastAPI (rotas e integração com o recomendador)
+│   ├── tests/                   # Testes automatizados com pytest (test_pipeline.py, test_recommender.py, test_evaluator.py)
+│   ├── pyproject.toml           # Configuração e dependências do ambiente Python
+│   └── uv.lock                  # Lockfile de dependências do uv
+│
+├── frontend/                    # Projeto React — Interface visual de demonstração e explicabilidade
+│   ├── public/                  # Arquivos estáticos
+│   ├── src/                     # Componentes, páginas e serviços de consumo da API
+│   └── package.json             # Dependências e scripts do frontend
+│
+├── INSTRUCOES.md                # Especificação e requisitos acadêmicos do trabalho
+└── README.md                    # Documentação principal do repositório
 ```
 
 ## 1. Pré-requisitos
@@ -59,11 +71,18 @@ cd recommender
 uv run python -m src.data.pipeline
 ```
 
+### Rodar os testes automatizados
+
+```bash
+cd recommender
+uv run pytest
+```
+
 ### Rodar o backend (FastAPI)
 
 ```bash
 cd recommender
-uv run uvicorn api.main:app --reload
+uv run uvicorn src.api.main:app --reload
 ```
 
 ### Rodar o frontend (React)
@@ -94,7 +113,7 @@ npm start
 
 ### 🔲 TO DO
 
-- **Backend FastAPI** (`recommender/api/`): criar `api/main:app` com endpoints de recomendação consumindo `ContentBasedRecommender`.
+- **Backend FastAPI** (`recommender/src/api/`): criar `src.api.main:app` com endpoints de recomendação consumindo `ContentBasedRecommender`.
 - **Frontend React** (`frontend/`): interface de demonstração que consome a API.
 - **Avaliação completa** com o dataset real (validação de Precision@N/Recall@N/nDCG@N em escala).
 
