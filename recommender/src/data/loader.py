@@ -9,7 +9,9 @@ from typing import List
 import pandas as pd
 
 
-RAW_DIR = Path(__file__).resolve().parents[2] / "data" / "raw"
+_ROOT_RAW = Path(__file__).resolve().parents[3] / "data" / "raw"
+_LOCAL_RAW = Path(__file__).resolve().parents[2] / "data" / "raw"
+RAW_DIR = _ROOT_RAW if _ROOT_RAW.exists() else _LOCAL_RAW
 
 
 def load_games(path: str | Path | None = None) -> pd.DataFrame:

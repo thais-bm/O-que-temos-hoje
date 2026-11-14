@@ -9,6 +9,8 @@ __pycache__/
 # Data
 /data/raw/
 /data/processed/
+node_modules/
+.vite/
 
 # Distribution / packaging
 .Python

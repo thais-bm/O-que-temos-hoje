@@ -11,15 +11,16 @@ Sistema de recomendação de jogos (Steam) baseado em TF-IDF + similaridade do c
 ## Estrutura
 
 ```
-src/data/        # Engenharia de dados: carregamento, limpeza, pré-processamento
-src/models/      # Modelo de recomendação (perfil do usuário, similaridade do cosseno, Top-N)
-src/evaluation/  # Avaliação: treino/teste, Precision@N, Recall@N, nDCG@N, baselines, cobertura
-src/app/         # Frontend React (interface de demonstração)
-api/             # Backend FastAPI (rotas de recomendação)
-data/raw/        # Dados brutos (não versionados)
-data/processed/  # Dados processados (gerados)
-tests/           # Testes automatizados (pytest)
-scripts/         # Scripts auxiliares
+data/raw/                # Dados brutos da Steam (não versionados)
+data/processed/          # Dados processados (gerados)
+recommender/             # Projeto Python (uv) — Motor de recomendação, avaliação e API
+  ├── src/data/          # Engenharia de dados: carregamento, limpeza, pré-processamento
+  ├── src/models/        # Modelo de recomendação (perfil do usuário, similaridade do cosseno, Top-N)
+  ├── src/evaluation/    # Avaliação: treino/teste, Precision@N, Recall@N, nDCG@N, baselines, cobertura
+  ├── api/               # Backend FastAPI (rotas de recomendação)
+  ├── tests/             # Testes automatizados (pytest)
+  └── pyproject.toml     # Dependências e configuração do projeto Python
+frontend/                # Frontend React (interface de demonstração)
 ```
 
 ## 1. Pré-requisitos
@@ -33,6 +34,7 @@ scripts/         # Scripts auxiliares
 Crie o ambiente Python e instale as dependências:
 
 ```bash
+cd recommender
 uv venv
 uv sync
 ```
@@ -40,32 +42,34 @@ uv sync
 Instale as dependências do frontend React:
 
 ```bash
-cd src/app
+cd frontend
 npm install
 ```
 
 ## 3. Dados
 
-Os arquivos brutos (`games.csv`, `games_metadata.json`, `users.csv`, `recommendations.csv`) devem ficar em `data/raw/`. Eles não são versionados (veja `.gitignore`).
+Os arquivos brutos (`games.csv`, `games_metadata.json`, `users.csv`, `recommendations.csv`) devem ficar em `data/raw/` na raiz do repositório. Eles não são versionados (veja `.gitignore`).
 
 ## 4. Execução
 
 ### Preparar os dados (engenharia de dados)
 
 ```bash
+cd recommender
 uv run python -m src.data.pipeline
 ```
 
 ### Rodar o backend (FastAPI)
 
 ```bash
+cd recommender
 uv run uvicorn api.main:app --reload
 ```
 
 ### Rodar o frontend (React)
 
 ```bash
-cd src/app
+cd frontend
 npm start
 ```
 
@@ -82,17 +86,16 @@ npm start
 
 ### ✅ Pronto
 
-- **Engenharia de dados** (`src/data/`): carregamento de arquivos brutos, limpeza de texto (stopwords EN/PT, stemming), construção de vetores de itens (TF-IDF + multi-hot tags + numéricos escalonados) e perfis de usuário (média ponderada por horas). Pipeline validado com dados reais.
-- **Modelo de recomendação** (`src/models/`): `ContentBasedRecommender` com similaridade do cosseno, Top-N e exclusão de itens já consumidos.
-- **Avaliação** (`src/evaluation/`): split treino/teste, Precision@N, Recall@N, nDCG@N, baselines (popularidade e aleatório), métrica de cobertura.
-- **Testes** (`tests/`): `test_recommender.py`, `test_evaluator.py`, `test_pipeline.py` (escritos, não executados ainda).
+- **Engenharia de dados** (`recommender/src/data/`): carregamento de arquivos brutos, limpeza de texto (stopwords EN/PT, stemming), construção de vetores de itens (TF-IDF + multi-hot tags + numéricos escalonados) e perfis de usuário (média ponderada por horas). Pipeline validado com dados reais.
+- **Modelo de recomendação** (`recommender/src/models/`): `ContentBasedRecommender` com similaridade do cosseno, Top-N e exclusão de itens já consumidos.
+- **Avaliação** (`recommender/src/evaluation/`): split treino/teste, Precision@N, Recall@N, nDCG@N, baselines (popularidade e aleatório), métrica de cobertura.
+- **Testes** (`recommender/tests/`): `test_recommender.py`, `test_evaluator.py`, `test_pipeline.py` (13/13 passando).
 - **README**: documentação da stack React + FastAPI e instruções de execução.
 
 ### 🔲 TO DO
 
-- **Backend FastAPI** (`api/`): criar `api/main:app` com endpoints de recomendação consumindo `ContentBasedRecommender`.
-- **Frontend React** (`src/app/`): interface de demonstração que consome a API.
-- **Executar testes pytest** e garantir cobertura.
+- **Backend FastAPI** (`recommender/api/`): criar `api/main:app` com endpoints de recomendação consumindo `ContentBasedRecommender`.
+- **Frontend React** (`frontend/`): interface de demonstração que consome a API.
 - **Avaliação completa** com o dataset real (validação de Precision@N/Recall@N/nDCG@N em escala).
 
 ## 7. Licença
