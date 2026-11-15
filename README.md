@@ -60,7 +60,20 @@ npm install
 
 ## 3. Dados
 
-Os arquivos brutos (`games.csv`, `games_metadata.json`, `users.csv`, `recommendations.csv`) devem ficar em `data/raw/` na raiz do repositório. Eles não são versionados (veja `.gitignore`).
+importação dos dados
+Faça o download do dataset em:
+https://www.kaggle.com/datasets/antonkozyriev/game-recommendations-on-steam
+Ponha os arquivos baixados em `data/raw`:
+`games.csv`
+`games_metadata.json`
+`recommendations.csv`
+`users.csv`
+e execute o script de importação dos dados (pode demorar alguns minutos):
+
+```bash
+python .\scripts\import_steam_db.py
+``` 
+Eles não são versionados (veja `.gitignore`).
 
 ## 4. Execução
 

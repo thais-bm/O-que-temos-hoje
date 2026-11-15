@@ -1,4 +1,5 @@
-import { useState, useMemo, useEffect } from 'react'
+
+import { useState, useMemo, useEffect, useCallback } from 'react'
 import {
   ThemeProvider,
   CssBaseline,
@@ -19,8 +20,6 @@ import {
   TextField,
   ToggleButtonGroup,
   ToggleButton,
-  Switch,
-  FormControlLabel,
   Button,
   IconButton,
   LinearProgress,
@@ -34,14 +33,18 @@ import {
   TableBody,
   SvgIcon,
   Avatar,
+  CircularProgress,
 } from '@mui/material'
 
 import { steamDarkTheme } from './theme'
-import { STEAM_CATALOG, REAL_STEAM_USERS } from './data/steamDataset'
-import { buildCatalogModel, computeRecommendations } from './utils/fbcEngine'
+import { REAL_STEAM_USERS } from './data/steamDataset'
 import {
   checkBackendHealth,
   fetchUserRecommendationsApi,
+  fetchColdStartRecommendationsApi,
+  fetchGamesApi,
+  fetchTagsApi,
+  fetchUsersApi,
   DEFAULT_API_URL,
 } from './services/api'
 import { GameCover } from './components/GameCover'
@@ -117,166 +120,538 @@ const POPULAR_GENRES = [
   'Roguelike',
 ]
 
+const INITIAL_USER_ID = 11764552
+const CATALOG_PAGE_SIZE = 24
+
+function formatNumber(value, decimals = 0) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '0'
+
+  return number.toLocaleString('pt-BR', {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  })
+}
+
+function formatPrice(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+    return 'Preço indisponível'
+  }
+
+  if (Number(value) === 0) return 'Gratuito para Jogar'
+
+  return `$ ${Number(value).toFixed(2)}`
+}
+
+function normalizePercentage(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return 0
+
+  return Math.abs(number) <= 1 ? number * 100 : number
+}
+
+function normalizeBreakdown(breakdown = {}) {
+  return {
+    tagsPct: normalizePercentage(
+      breakdown.tags_pct ??
+      breakdown.tagsPct ??
+      breakdown.tags ??
+      breakdown.tag
+    ),
+    tfidfPct: normalizePercentage(
+      breakdown.tfidf_pct ??
+      breakdown.tfidfPct ??
+      breakdown.tfidf ??
+      breakdown.description
+    ),
+    numPct: normalizePercentage(
+      breakdown.num_pct ??
+      breakdown.numPct ??
+      breakdown.numeric ??
+      breakdown.numerical
+    ),
+  }
+}
+
+function normalizeRecommendation(item) {
+  const explanation = item.explanation || {}
+  const similar = explanation.most_similar_consumed || null
+
+  return {
+    app_id: Number(item.app_id),
+    similarity: Number(item.similarity) || 0,
+    game: {
+      app_id: Number(item.app_id),
+      title: item.title || `App #${item.app_id}`,
+      rating: item.rating,
+      positive_ratio: item.positive_ratio,
+      user_reviews: item.user_reviews,
+      date_release: item.date_release,
+      price_final: item.price_final,
+      price_original: item.price_original,
+      discount: item.discount,
+      description: item.description || '',
+      tags: item.tags || [],
+    },
+    explanation: {
+      mostSimilarConsumed: similar
+        ? {
+            app_id: similar.app_id,
+            title: similar.title,
+            hours: Number(similar.hours) || 0,
+            itemSimilarity: Number(similar.similarity) || 0,
+            isRecommended: similar.is_recommended,
+          }
+        : null,
+      matchedTags: (explanation.matched_tags || []).map((feature) => ({
+        tag: feature.label,
+        contribution: Number(feature.contribution) || 0,
+        profileWeight: Number(feature.profile_weight) || 0,
+      })),
+      matchedTerms: (explanation.matched_terms || []).map((feature) => ({
+        term: feature.label,
+        contribution: Number(feature.contribution) || 0,
+        profileWeight: Number(feature.profile_weight) || 0,
+      })),
+      breakdown: normalizeBreakdown(explanation.breakdown),
+    },
+  }
+}
+
+function normalizeProfile(profile = {}) {
+  return {
+    totalHours: Number(profile.total_hours) || 0,
+    validGames: Number(profile.valid_games) || 0,
+    validInteractions: Number(profile.valid_interactions) || 0,
+    positiveInteractions: Number(profile.positive_interactions) || 0,
+    negativeInteractions: Number(profile.negative_interactions) || 0,
+    topTags: (profile.top_tags || []).map((feature) => ({
+      label: feature.label,
+      weight: Number(feature.weight) || 0,
+    })),
+    topTerms: (profile.top_terms || []).map((feature) => ({
+      label: feature.label,
+      weight: Number(feature.weight) || 0,
+    })),
+    historyWithWeight: (profile.history_with_weight || []).map((item) => ({
+      app_id: Number(item.app_id),
+      hours: Number(item.hours) || 0,
+      is_recommended: Boolean(item.is_recommended),
+      weight: Number(item.weight) || 0,
+      weight_share_pct: Number(item.weight_share_pct) || 0,
+      game: null,
+    })),
+  }
+}
+
 function App() {
-  // 'existing' (Usuário já existente) | 'new' (Novo usuário — começa zerado!)
   const [userType, setUserType] = useState('existing')
-  const [pageView, setPageView] = useState('forYou') // 'forYou' | 'catalog'
+  const [pageView, setPageView] = useState('forYou')
 
-  // Existing user state
-  const [selectedUserId, setSelectedUserId] = useState(REAL_STEAM_USERS[0].user_id)
+  // Usuário existente: o ID inicial já foi validado no backend.
+  const [selectedUserId, setSelectedUserId] = useState(INITIAL_USER_ID)
   const [customUidInput, setCustomUidInput] = useState('')
+  const [userMetadata, setUserMetadata] = useState(null)
+  const [lookupLoading, setLookupLoading] = useState(false)
 
-  // New user state: starts empty (0 games played, 0 genres selected)
+  // Preferências de cold-start.
   const [newUserTags, setNewUserTags] = useState([])
   const [newUserRefGames, setNewUserRefGames] = useState([])
   const [selectedAddGameId, setSelectedAddGameId] = useState('')
 
-  // User-facing recommendation preferences
+  // Quantidade de recomendações.
   const [topN, setTopN] = useState(10)
-  const [useNegativeDislikes, setUseNegativeDislikes] = useState(true)
-  const [useMmr, setUseMmr] = useState(false)
 
-  // Catalog filters
+  // Catálogo remoto.
   const [catalogSearch, setCatalogSearch] = useState('')
   const [catalogTagFilter, setCatalogTagFilter] = useState('ALL')
+  const [catalogGames, setCatalogGames] = useState([])
+  const [catalogTotal, setCatalogTotal] = useState(0)
+  const [catalogHasMore, setCatalogHasMore] = useState(false)
+  const [catalogOffset, setCatalogOffset] = useState(0)
+  const [catalogLoading, setCatalogLoading] = useState(false)
+  const [catalogLoadingMore, setCatalogLoadingMore] = useState(false)
+  const [catalogError, setCatalogError] = useState('')
+  const [allCatalogTags, setAllCatalogTags] = useState([])
 
-  // Details dialog
-  const [inspectedRec, setInspectedRec] = useState(null)
+  // Recomendações remotas.
+  const [recommendations, setRecommendations] = useState([])
+  const [profileSummary, setProfileSummary] = useState({
+    totalHours: 0,
+    validGames: 0,
+    validInteractions: 0,
+    positiveInteractions: 0,
+    negativeInteractions: 0,
+    topTags: [],
+    topTerms: [],
+    historyWithWeight: [],
+  })
+  const [recommendationLoading, setRecommendationLoading] = useState(false)
+  const [recommendationError, setRecommendationError] = useState('')
+  const [recommendationSource, setRecommendationSource] = useState('')
 
-  // API state
+  // Estado geral da API.
   const apiUrl = DEFAULT_API_URL
   const [apiOnline, setApiOnline] = useState(false)
-  const [apiOverrideIds, setApiOverrideIds] = useState(null)
 
-  const catalogModel = useMemo(() => buildCatalogModel(STEAM_CATALOG), [])
+  // Dialog de explicação.
+  const [inspectedRec, setInspectedRec] = useState(null)
 
+  const selectedExistingUser = useMemo(() => {
+    return (
+      REAL_STEAM_USERS.find(
+        (user) => Number(user.user_id) === Number(selectedUserId)
+      ) || null
+    )
+  }, [selectedUserId])
+
+  const selectedHandle =
+    selectedExistingUser?.handle ||
+    userMetadata?.handle ||
+    'Usuário Steam'
+
+  const newUserHasAnyPreference =
+    newUserTags.length > 0 || newUserRefGames.length > 0
+
+  const catalogGamesById = useMemo(
+    () => new Map(catalogGames.map((game) => [Number(game.app_id), game])),
+    [catalogGames]
+  )
+
+  const availablePopularTags = useMemo(() => {
+    const canonical = new Map(
+      allCatalogTags.map((tag) => [tag.toLocaleLowerCase('pt-BR'), tag])
+    )
+
+    const matched = POPULAR_GENRES
+      .map((genre) => canonical.get(genre.toLocaleLowerCase('pt-BR')))
+      .filter(Boolean)
+
+    return matched.length > 0 ? matched : allCatalogTags.slice(0, 20)
+  }, [allCatalogTags])
+
+  const availableGamesToPick = useMemo(() => {
+    const picked = new Set(newUserRefGames.map((item) => Number(item.app_id)))
+
+    return catalogGames.filter(
+      (game) => !picked.has(Number(game.app_id))
+    )
+  }, [catalogGames, newUserRefGames])
+
+  // Verifica a API e carrega as tags reais do catálogo.
   useEffect(() => {
-    let mounted = true
-    checkBackendHealth(apiUrl).then((res) => {
-      if (mounted) setApiOnline(res.online)
+    let active = true
+
+    checkBackendHealth(apiUrl).then((result) => {
+      if (active) setApiOnline(result.online)
     })
+
+    fetchTagsApi()
+      .then((tags) => {
+        if (active) setAllCatalogTags(tags)
+      })
+      .catch((error) => {
+        if (active) setCatalogError(error.message)
+      })
+
     return () => {
-      mounted = false
+      active = false
     }
   }, [apiUrl])
 
-  const selectedExistingUser = useMemo(
-    () =>
-      REAL_STEAM_USERS.find((u) => u.user_id === Number(selectedUserId)) || REAL_STEAM_USERS[0],
-    [selectedUserId]
-  )
+  // Carrega a primeira página do catálogo.
+  // O pequeno atraso evita várias consultas durante a digitação.
+  useEffect(() => {
+    let active = true
 
-  const activeInteractions = useMemo(() => {
-    if (userType === 'new') return newUserRefGames
-    return selectedExistingUser?.interactions || []
-  }, [userType, newUserRefGames, selectedExistingUser])
+    const timer = setTimeout(async () => {
+      setCatalogLoading(true)
+      setCatalogError('')
+      setCatalogOffset(0)
 
-  const fbcResult = useMemo(() => {
-    const res = computeRecommendations(catalogModel, activeInteractions, {
-      topN,
-      excludeConsumed: true,
-      useNegativeDislikes,
-      useMmr,
-      mmrLambda: 0.72,
-      selectedTags: userType === 'new' ? newUserTags : [],
-      isNewUser: userType === 'new',
-    })
+      try {
+        const result = await fetchGamesApi({
+          search: catalogSearch,
+          tag: catalogTagFilter,
+          limit: CATALOG_PAGE_SIZE,
+          offset: 0,
+          baseUrl: apiUrl,
+        })
 
-    if (apiOverrideIds && apiOverrideIds.length > 0 && userType === 'existing') {
-      const byId = new Map(res.recommendations.map((r) => [r.app_id, r]))
-      const reordered = []
-      apiOverrideIds.slice(0, topN).forEach((aid, idx) => {
-        const idNum = typeof aid === 'object' ? Number(aid.app_id) : Number(aid)
-        if (byId.has(idNum)) {
-          reordered.push({ ...byId.get(idNum), rank: idx + 1 })
-        }
-      })
-      if (reordered.length > 0) {
-        return { ...res, recommendations: reordered }
+        if (!active) return
+
+        setCatalogGames(result.games)
+        setCatalogTotal(result.total)
+        setCatalogHasMore(result.hasMore)
+        setCatalogOffset(result.games.length)
+        setApiOnline(true)
+      } catch (error) {
+        if (!active) return
+
+        setCatalogGames([])
+        setCatalogTotal(0)
+        setCatalogHasMore(false)
+        setCatalogError(error.message)
+      } finally {
+        if (active) setCatalogLoading(false)
       }
+    }, 250)
+
+    return () => {
+      active = false
+      clearTimeout(timer)
     }
-    return res
+  }, [catalogSearch, catalogTagFilter, apiUrl])
+
+  // Carrega mais jogos usando a paginação do backend.
+  const handleLoadMoreCatalog = useCallback(async () => {
+    if (catalogLoadingMore || !catalogHasMore) return
+
+    setCatalogLoadingMore(true)
+    setCatalogError('')
+
+    try {
+      const result = await fetchGamesApi({
+        search: catalogSearch,
+        tag: catalogTagFilter,
+        limit: CATALOG_PAGE_SIZE,
+        offset: catalogOffset,
+        baseUrl: apiUrl,
+      })
+
+      setCatalogGames((previous) => {
+        const existingIds = new Set(previous.map((game) => Number(game.app_id)))
+        const newGames = result.games.filter(
+          (game) => !existingIds.has(Number(game.app_id))
+        )
+
+        return [...previous, ...newGames]
+      })
+
+      setCatalogOffset((previous) => previous + result.games.length)
+      setCatalogHasMore(result.hasMore)
+      setApiOnline(true)
+    } catch (error) {
+      setCatalogError(error.message)
+    } finally {
+      setCatalogLoadingMore(false)
+    }
   }, [
-    catalogModel,
-    activeInteractions,
-    topN,
-    useNegativeDislikes,
-    useMmr,
-    apiOverrideIds,
-    userType,
-    newUserTags,
+    catalogLoadingMore,
+    catalogHasMore,
+    catalogSearch,
+    catalogTagFilter,
+    catalogOffset,
+    apiUrl,
   ])
 
-  async function handleLookupSteamId(e) {
-    e.preventDefault()
+  // Busca recomendações reais sempre que o perfil ou top N mudar.
+  useEffect(() => {
+    let active = true
+
+    async function loadRecommendations() {
+      setRecommendationError('')
+      setRecommendations([])
+      setProfileSummary({
+        totalHours: 0,
+        validGames: 0,
+        validInteractions: 0,
+        positiveInteractions: 0,
+        negativeInteractions: 0,
+        topTags: [],
+        topTerms: [],
+        historyWithWeight: [],
+      })
+
+      if (userType === 'new' && !newUserHasAnyPreference) {
+        setRecommendationLoading(false)
+        setRecommendationSource('')
+        return
+      }
+
+      setRecommendationLoading(true)
+
+      try {
+        let result
+
+        if (userType === 'existing') {
+          result = await fetchUserRecommendationsApi(selectedUserId, {
+            topN,
+            excludeConsumed: true,
+            baseUrl: apiUrl,
+          })
+
+          if (!active) return
+
+          const payload = result.payload
+          setProfileSummary(normalizeProfile(payload.profile))
+          setRecommendationSource('historical')
+        } else {
+          result = await fetchColdStartRecommendationsApi({
+            appIds: newUserRefGames.map((item) => Number(item.app_id)),
+            tags: newUserTags,
+            topN,
+            baseUrl: apiUrl,
+          })
+
+          if (!active) return
+
+          const profile = result.payload.profile || {}
+
+          setProfileSummary({
+            totalHours: 0,
+            validGames: Number(profile.num_reference_games) || 0,
+            validInteractions: 0,
+            positiveInteractions: 0,
+            negativeInteractions: 0,
+            topTags: (profile.top_tags || []).map((feature) => ({
+              label: feature.label,
+              weight: Number(feature.weight) || 0,
+            })),
+            topTerms: (profile.top_terms || []).map((feature) => ({
+              label: feature.label,
+              weight: Number(feature.weight) || 0,
+            })),
+            historyWithWeight: [],
+          })
+
+          setRecommendationSource('cold-start')
+        }
+
+        if (!active) return
+
+        setRecommendations(
+          (result.rawList || []).map(normalizeRecommendation)
+        )
+        setApiOnline(true)
+      } catch (error) {
+        if (!active) return
+
+        setRecommendationError(error.message)
+        setRecommendationSource('')
+      } finally {
+        if (active) setRecommendationLoading(false)
+      }
+    }
+
+    loadRecommendations()
+
+    return () => {
+      active = false
+    }
+  }, [
+    userType,
+    selectedUserId,
+    topN,
+    newUserTags,
+    newUserRefGames,
+    newUserHasAnyPreference,
+    apiUrl,
+  ])
+
+  async function handleLookupSteamId(event) {
+    event.preventDefault()
+
     const trimmed = customUidInput.trim()
     if (!trimmed) return
+
     const uid = Number(trimmed)
-    const known = REAL_STEAM_USERS.find((u) => u.user_id === uid)
-    if (known) {
-      setSelectedUserId(known.user_id)
-      setApiOverrideIds(null)
+
+    if (!Number.isSafeInteger(uid) || uid < 0) {
+      setRecommendationError('Informe um Steam ID numérico válido.')
       return
     }
-    const apiRes = await fetchUserRecommendationsApi(uid, {
-      topN,
-      excludeConsumed: true,
-      baseUrl: apiUrl,
-    })
-    if (apiRes.fromApi && apiRes.rawList?.length) {
-      setApiOverrideIds(apiRes.rawList)
+
+    setLookupLoading(true)
+    setRecommendationError('')
+
+    try {
+      const userResult = await fetchUsersApi({
+        userId: uid,
+        baseUrl: apiUrl,
+      })
+
+      if (!userResult.users?.length) {
+        throw new Error(`A conta #${uid} não foi encontrada no banco de dados.`)
+      }
+
+      // A consulta de recomendações confirma se existe histórico utilizável.
+      await fetchUserRecommendationsApi(uid, {
+        topN,
+        excludeConsumed: true,
+        baseUrl: apiUrl,
+      })
+
+      setSelectedUserId(uid)
+      setUserMetadata(userResult.users[0])
+      setUserType('existing')
+      setPageView('forYou')
       setApiOnline(true)
-    } else {
-      alert(`Não foi possível encontrar a conta #${uid}. Verifique o ID ou escolha um perfil da lista.`)
+      setCustomUidInput('')
+    } catch (error) {
+      setRecommendationError(error.message)
+    } finally {
+      setLookupLoading(false)
     }
   }
 
   function handleToggleNewUserTag(tag) {
-    setNewUserTags((prev) =>
-      prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]
+    setNewUserTags((previous) =>
+      previous.includes(tag)
+        ? previous.filter((item) => item !== tag)
+        : [...previous, tag]
     )
   }
 
   function handleAddRefGameToNewUser(appId) {
-    const idNum = Number(appId)
-    if (!idNum || newUserRefGames.some((i) => i.app_id === idNum)) return
-    setNewUserRefGames((prev) => [...prev, { app_id: idNum, is_recommended: true }])
+    const id = Number(appId)
+
+    if (!Number.isSafeInteger(id) || id <= 0) return
+    if (newUserRefGames.some((item) => Number(item.app_id) === id)) return
+
+    if (newUserRefGames.length >= 20) {
+      setRecommendationError('O cold-start permite no máximo 20 jogos de referência.')
+      return
+    }
+
+    setNewUserRefGames((previous) => [
+      ...previous,
+      { app_id: id, is_recommended: true },
+    ])
+
     setSelectedAddGameId('')
+    setRecommendationError('')
   }
 
   function handleRemoveNewUserRefGame(appId) {
-    setNewUserRefGames((prev) => prev.filter((i) => i.app_id !== appId))
+    setNewUserRefGames((previous) =>
+      previous.filter((item) => Number(item.app_id) !== Number(appId))
+    )
   }
 
-  const allCatalogTags = useMemo(() => {
-    const s = new Set()
-    STEAM_CATALOG.forEach((g) => (g.tags || []).forEach((t) => s.add(t)))
-    return Array.from(s).sort()
-  }, [])
+  function handleSelectExistingUser(userId) {
+    setSelectedUserId(Number(userId))
+    setUserMetadata(null)
+    setRecommendationError('')
+  }
 
-  const filteredCatalog = useMemo(() => {
-    return STEAM_CATALOG.filter((g) => {
-      const matchesQuery =
-        !catalogSearch.trim() ||
-        g.title.toLowerCase().includes(catalogSearch.toLowerCase()) ||
-        (g.description || '').toLowerCase().includes(catalogSearch.toLowerCase())
-      const matchesTag = catalogTagFilter === 'ALL' || (g.tags || []).includes(catalogTagFilter)
-      return matchesQuery && matchesTag
-    })
-  }, [catalogSearch, catalogTagFilter])
-
-  const availableGamesToPick = useMemo(() => {
-    const picked = new Set(newUserRefGames.map((i) => i.app_id))
-    return STEAM_CATALOG.filter((g) => !picked.has(g.app_id))
-  }, [newUserRefGames])
-
-  const newUserHasAnyPreference = newUserTags.length > 0 || newUserRefGames.length > 0
+  const existingPresetIds = REAL_STEAM_USERS.map((user) =>
+    Number(user.user_id)
+  )
 
   return (
     <ThemeProvider theme={steamDarkTheme}>
       <CssBaseline />
-      <Box sx={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', bgcolor: 'background.default' }}>
-        {/* Top Bar */}
+
+      <Box
+        sx={{
+          minHeight: '100vh',
+          display: 'flex',
+          flexDirection: 'column',
+          bgcolor: 'background.default',
+        }}
+      >
+        {/* Barra superior */}
         <AppBar
           position="sticky"
           elevation={0}
@@ -296,15 +671,20 @@ function App() {
                 gap: 2,
               }}
             >
-              {/* Brand + Navigation */}
               <Stack direction="row" spacing={3} sx={{ alignItems: 'center' }}>
                 <Box>
                   <Typography
                     variant="h6"
-                    sx={{ fontWeight: 700, letterSpacing: '0.02em', color: '#fff', lineHeight: 1.2 }}
+                    sx={{
+                      fontWeight: 700,
+                      letterSpacing: '0.02em',
+                      color: '#fff',
+                      lineHeight: 1.2,
+                    }}
                   >
                     O QUE TEMOS HOJE?
                   </Typography>
+
                   <Typography variant="caption" color="text.secondary">
                     Descoberta personalizada de jogos na Steam
                   </Typography>
@@ -319,6 +699,7 @@ function App() {
                   >
                     Para Você
                   </Button>
+
                   <Button
                     variant={pageView === 'catalog' ? 'contained' : 'text'}
                     color="primary"
@@ -330,20 +711,25 @@ function App() {
                 </Stack>
               </Stack>
 
-              {/* Switcher: Usuário Existente vs. Novo Usuário */}
               <Stack direction="row" spacing={1.5} sx={{ alignItems: 'center' }}>
-                <Typography variant="caption" color="text.secondary" sx={{ display: { xs: 'none', sm: 'block' } }}>
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ display: { xs: 'none', sm: 'block' } }}
+                >
                   Perfil:
                 </Typography>
+
                 <ToggleButtonGroup
                   size="small"
                   color="primary"
                   value={userType}
                   exclusive
-                  onChange={(_, val) => {
-                    if (val) {
-                      setUserType(val)
+                  onChange={(_, value) => {
+                    if (value) {
+                      setUserType(value)
                       setPageView('forYou')
+                      setRecommendationError('')
                     }
                   }}
                   sx={{ bgcolor: '#10161f' }}
@@ -352,6 +738,7 @@ function App() {
                     <UserIcon fontSize="small" />
                     Usuário Já Existente
                   </ToggleButton>
+
                   <ToggleButton value="new" sx={{ px: 2, gap: 1 }}>
                     <PersonAddIcon fontSize="small" />
                     Novo Usuário
@@ -362,11 +749,11 @@ function App() {
           </Container>
         </AppBar>
 
-        {/* Main Content */}
+        {/* Conteúdo principal */}
         <Container maxWidth="xl" sx={{ py: 3.5, flex: 1 }}>
           {pageView === 'forYou' ? (
             <Stack spacing={3}>
-              {/* Top Profile / Onboarding Section */}
+              {/* Perfil / onboarding */}
               <Paper sx={{ p: 3, bgcolor: '#16202d' }}>
                 {userType === 'existing' ? (
                   <Grid container spacing={3} sx={{ alignItems: 'center' }}>
@@ -381,18 +768,22 @@ function App() {
                             fontWeight: 700,
                           }}
                         >
-                          {selectedExistingUser.handle.slice(0, 2).toUpperCase()}
+                          {selectedHandle.slice(0, 2).toUpperCase()}
                         </Avatar>
+
                         <Box>
                           <Typography variant="subtitle2" color="primary.main">
-                            Conta Steam Conectada
+                            Conta Steam consultada no banco
                           </Typography>
+
                           <Typography variant="h6" sx={{ lineHeight: 1.25 }}>
-                            Olá, {selectedExistingUser.handle}
+                            Olá, {selectedHandle}
                           </Typography>
+
                           <Typography variant="caption" color="text.secondary">
-                            ID #{selectedExistingUser.user_id} · {fbcResult.profileSummary.validGames}{' '}
-                            jogos na biblioteca ({fbcResult.profileSummary.totalHours}h jogadas)
+                            ID #{selectedUserId} ·{' '}
+                            {formatNumber(profileSummary.validGames)} jogos na biblioteca
+                            {' '}({formatNumber(profileSummary.totalHours, 1)}h jogadas)
                           </Typography>
                         </Box>
                       </Stack>
@@ -400,19 +791,30 @@ function App() {
 
                     <Grid size={{ xs: 12, sm: 7, md: 4 }}>
                       <FormControl fullWidth size="small">
-                        <InputLabel id="switch-account-label">Trocar de conta existente</InputLabel>
+                        <InputLabel id="switch-account-label">
+                          Trocar de conta existente
+                        </InputLabel>
+
                         <Select
                           labelId="switch-account-label"
                           label="Trocar de conta existente"
                           value={selectedUserId}
-                          onChange={(e) => {
-                            setSelectedUserId(Number(e.target.value))
-                            setApiOverrideIds(null)
-                          }}
+                          onChange={(event) =>
+                            handleSelectExistingUser(event.target.value)
+                          }
                         >
-                          {REAL_STEAM_USERS.map((u) => (
-                            <MenuItem key={u.user_id} value={u.user_id}>
-                              {u.handle} ({u.interactions.length} jogos)
+                          {!existingPresetIds.includes(Number(selectedUserId)) && (
+                            <MenuItem value={selectedUserId}>
+                              Usuário #{selectedUserId}
+                            </MenuItem>
+                          )}
+
+                          {REAL_STEAM_USERS.map((user) => (
+                            <MenuItem
+                              key={user.user_id}
+                              value={Number(user.user_id)}
+                            >
+                              {user.handle} (ID #{user.user_id})
                             </MenuItem>
                           ))}
                         </Select>
@@ -430,16 +832,27 @@ function App() {
                           size="small"
                           placeholder="Buscar por Steam ID..."
                           value={customUidInput}
-                          onChange={(e) => setCustomUidInput(e.target.value)}
+                          onChange={(event) =>
+                            setCustomUidInput(event.target.value)
+                          }
                         />
-                        <Button type="submit" variant="outlined" size="small">
-                          Carregar
+
+                        <Button
+                          type="submit"
+                          variant="outlined"
+                          size="small"
+                          disabled={lookupLoading}
+                        >
+                          {lookupLoading ? (
+                            <CircularProgress size={18} />
+                          ) : (
+                            'Carregar'
+                          )}
                         </Button>
                       </Box>
                     </Grid>
                   </Grid>
                 ) : (
-                  /* New User Onboarding: starts clean, picks genres or reference titles without fake hours */
                   <Stack spacing={2.5}>
                     <Box
                       sx={{
@@ -454,12 +867,14 @@ function App() {
                         <Typography variant="subtitle2" color="secondary.main">
                           Novo Usuário · Sem histórico de jogos
                         </Typography>
+
                         <Typography variant="h6" sx={{ mt: 0.25 }}>
                           O que você tem vontade de jogar hoje?
                         </Typography>
+
                         <Typography variant="body2" color="text.secondary">
-                          Como você ainda não tem histórico na plataforma, selecione abaixo os
-                          gêneros que mais te interessam ou algum título de referência.
+                          Selecione tags e jogos de referência. O sistema usará
+                          essas preferências para gerar recomendações iniciais.
                         </Typography>
                       </Box>
 
@@ -471,12 +886,11 @@ function App() {
                           onClick={() => {
                             setNewUserTags([])
                             setNewUserRefGames([])
+                            setRecommendationError('')
                           }}
                           sx={{
                             color: 'text.secondary',
                             whiteSpace: 'nowrap',
-                            alignSelf: { xs: 'flex-start', sm: 'center' },
-                            flexShrink: 0,
                             px: 1.5,
                             py: 0.5,
                             fontSize: '0.78rem',
@@ -488,163 +902,264 @@ function App() {
                     </Box>
 
                     <Box>
-                      <Typography variant="subtitle2" sx={{ mb: 1, color: 'text.primary' }}>
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>
                         1. Escolha seus gêneros de interesse:
                       </Typography>
-                      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
-                        {POPULAR_GENRES.map((genre) => {
-                          const selected = newUserTags.includes(genre)
-                          return (
-                            <Chip
-                              key={genre}
-                              label={genre}
-                              clickable
-                              color={selected ? 'primary' : 'default'}
-                              variant={selected ? 'filled' : 'outlined'}
-                              onClick={() => handleToggleNewUserTag(genre)}
-                            />
-                          )
-                        })}
-                      </Box>
+
+                      {allCatalogTags.length === 0 ? (
+                        <Typography variant="caption" color="text.secondary">
+                          {catalogLoading
+                            ? 'Carregando tags do catálogo...'
+                            : 'Não foi possível carregar as tags.'}
+                        </Typography>
+                      ) : (
+                        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                          {availablePopularTags.map((genre) => {
+                            const selected = newUserTags.includes(genre)
+
+                            return (
+                              <Chip
+                                key={genre}
+                                label={genre}
+                                clickable
+                                color={selected ? 'primary' : 'default'}
+                                variant={selected ? 'filled' : 'outlined'}
+                                onClick={() => handleToggleNewUserTag(genre)}
+                              />
+                            )
+                          })}
+                        </Box>
+                      )}
                     </Box>
 
                     <Box sx={{ maxWidth: 680 }}>
-                      <Typography variant="subtitle2" sx={{ mb: 1, color: 'text.primary' }}>
-                        2. Opcional — Marque algum jogo específico que tenha chamado sua atenção:
+                      <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                        2. Opcional — Marque jogos específicos que chamaram sua atenção:
                       </Typography>
+
                       <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
                         <FormControl fullWidth size="small">
                           <InputLabel id="new-user-add-game">
                             Selecionar um título de referência...
                           </InputLabel>
+
                           <Select
                             labelId="new-user-add-game"
                             label="Selecionar um título de referência..."
                             value={selectedAddGameId}
-                            onChange={(e) => setSelectedAddGameId(e.target.value)}
+                            onChange={(event) =>
+                              setSelectedAddGameId(event.target.value)
+                            }
                           >
-                            {availableGamesToPick.map((g) => (
-                              <MenuItem key={g.app_id} value={g.app_id}>
-                                {g.title} ({(g.tags || []).slice(0, 2).join(', ')})
+                            {availableGamesToPick.map((game) => (
+                              <MenuItem
+                                key={game.app_id}
+                                value={String(game.app_id)}
+                              >
+                                {game.title} ({(game.tags || []).slice(0, 2).join(', ')})
                               </MenuItem>
                             ))}
                           </Select>
                         </FormControl>
+
                         <Button
                           variant="contained"
                           color="primary"
                           size="small"
                           startIcon={<AddIcon />}
                           disabled={!selectedAddGameId}
-                          onClick={() => handleAddRefGameToNewUser(selectedAddGameId)}
-                          sx={{ px: 2, py: 0.9, whiteSpace: 'nowrap', flexShrink: 0 }}
+                          onClick={() =>
+                            handleAddRefGameToNewUser(selectedAddGameId)
+                          }
+                          sx={{
+                            px: 2,
+                            py: 0.9,
+                            whiteSpace: 'nowrap',
+                            flexShrink: 0,
+                          }}
                         >
                           Marcar interesse
                         </Button>
                       </Box>
+
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        sx={{ display: 'block', mt: 0.75 }}
+                      >
+                        A lista apresenta os jogos carregados do catálogo. Você
+                        também pode pesquisar outros títulos em Explorar Catálogo.
+                      </Typography>
                     </Box>
                   </Stack>
                 )}
               </Paper>
 
-              {/* Main 2-Column Store Layout */}
+              {recommendationError && (
+                <Paper
+                  sx={{
+                    p: 2,
+                    bgcolor: 'rgba(211, 47, 47, 0.10)',
+                    border: '1px solid',
+                    borderColor: 'error.dark',
+                  }}
+                >
+                  <Typography variant="body2" color="error.light">
+                    {recommendationError}
+                  </Typography>
+                </Paper>
+              )}
+
+              {/* Layout de duas colunas */}
               <Grid container spacing={3}>
-                {/* Left Column */}
+                {/* Coluna esquerda */}
                 <Grid size={{ xs: 12, lg: 4 }}>
                   {userType === 'existing' ? (
                     <Stack spacing={2.5}>
                       <Paper sx={{ p: 2.5 }}>
                         <Stack
                           direction="row"
-                          sx={{ justifyContent: 'space-between', alignItems: 'center', mb: 2 }}
+                          sx={{
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            mb: 2,
+                          }}
                         >
-                          <Typography variant="h6">Sua Biblioteca Recente</Typography>
+                          <Typography variant="h6">
+                            Sua Biblioteca Recente
+                          </Typography>
+
                           <Typography variant="caption" color="text.secondary">
-                            {fbcResult.profileSummary.totalHours}h jogadas
+                            {formatNumber(profileSummary.totalHours, 1)}h jogadas
                           </Typography>
                         </Stack>
 
-                        <Stack spacing={1.25}>
-                          {(fbcResult.profileSummary.historyWithWeight || []).map((item) => (
-                            <Paper
-                              key={item.app_id}
-                              sx={{
-                                p: 1.25,
-                                bgcolor: '#121a24',
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: 1.5,
-                              }}
+                        {recommendationLoading ? (
+                          <Box sx={{ py: 3, textAlign: 'center' }}>
+                            <CircularProgress size={24} />
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              sx={{ display: 'block', mt: 1 }}
                             >
-                              <Box sx={{ width: 84, height: 40, flexShrink: 0 }}>
-                                <GameCover
-                                  appId={item.app_id}
-                                  title={item.game?.title || ''}
-                                />
-                              </Box>
-
-                              <Box sx={{ flex: 1, minWidth: 0 }}>
-                                <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap>
-                                  {item.game?.title || `App #${item.app_id}`}
-                                </Typography>
-                                <Stack
-                                  direction="row"
-                                  spacing={1}
-                                  sx={{ alignItems: 'center', mt: 0.25 }}
+                              Carregando histórico...
+                            </Typography>
+                          </Box>
+                        ) : profileSummary.historyWithWeight.length === 0 ? (
+                          <Typography variant="body2" color="text.secondary">
+                            Nenhum histórico disponível para este usuário.
+                          </Typography>
+                        ) : (
+                          <Stack spacing={1.25}>
+                            {profileSummary.historyWithWeight.map((item) => (
+                              <Paper
+                                key={item.app_id}
+                                sx={{
+                                  p: 1.25,
+                                  bgcolor: '#121a24',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: 1.5,
+                                }}
+                              >
+                                <Box
+                                  sx={{
+                                    width: 84,
+                                    height: 40,
+                                    flexShrink: 0,
+                                  }}
                                 >
-                                  <Typography variant="caption" color="text.secondary">
-                                    {item.hours}h jogadas
-                                  </Typography>
-                                  <Chip
-                                    label={
-                                      item.is_recommended !== false
-                                        ? 'Recomendou'
-                                        : 'Não recomendou'
-                                    }
-                                    size="small"
-                                    color={item.is_recommended !== false ? 'default' : 'error'}
-                                    variant="outlined"
-                                    sx={{ height: 18, fontSize: '0.66rem' }}
+                                  <GameCover
+                                    appId={item.app_id}
+                                    title={item.game?.title || ''}
                                   />
-                                </Stack>
-                              </Box>
-                            </Paper>
-                          ))}
-                        </Stack>
+                                </Box>
+
+                                <Box sx={{ flex: 1, minWidth: 0 }}>
+                                  <Typography
+                                    variant="body2"
+                                    sx={{ fontWeight: 600 }}
+                                    noWrap
+                                  >
+                                    {item.game?.title || `App #${item.app_id}`}
+                                  </Typography>
+
+                                  <Stack
+                                    direction="row"
+                                    spacing={1}
+                                    sx={{ alignItems: 'center', mt: 0.25 }}
+                                  >
+                                    <Typography
+                                      variant="caption"
+                                      color="text.secondary"
+                                    >
+                                      {formatNumber(item.hours, 1)}h jogadas
+                                    </Typography>
+
+                                    <Chip
+                                      label={
+                                        item.is_recommended
+                                          ? 'Recomendou'
+                                          : 'Não recomendou'
+                                      }
+                                      size="small"
+                                      color={
+                                        item.is_recommended ? 'default' : 'error'
+                                      }
+                                      variant="outlined"
+                                      sx={{
+                                        height: 18,
+                                        fontSize: '0.66rem',
+                                      }}
+                                    />
+                                  </Stack>
+                                </Box>
+                              </Paper>
+                            ))}
+                          </Stack>
+                        )}
                       </Paper>
 
-                      {fbcResult.profileSummary.topTags.length > 0 && (
+                      {profileSummary.topTags.length > 0 && (
                         <Paper sx={{ p: 2.5 }}>
                           <Typography variant="h6" sx={{ mb: 0.5 }}>
                             Seus Gêneros Mais Jogados
                           </Typography>
+
                           <Typography
                             variant="caption"
                             color="text.secondary"
                             sx={{ display: 'block', mb: 2 }}
                           >
-                            Calculado automaticamente pelo seu tempo de jogo
+                            Características mais relevantes do seu perfil
                           </Typography>
 
                           <Stack spacing={1.25}>
-                            {fbcResult.profileSummary.topTags.slice(0, 6).map((t) => (
-                              <Box key={t.label}>
+                            {profileSummary.topTags.slice(0, 6).map((tag) => (
+                              <Box key={tag.label}>
                                 <Stack
                                   direction="row"
-                                  sx={{ justifyContent: 'space-between', mb: 0.4 }}
+                                  sx={{
+                                    justifyContent: 'space-between',
+                                    mb: 0.4,
+                                  }}
                                 >
-                                  <Typography variant="body2">{t.label}</Typography>
+                                  <Typography variant="body2">
+                                    {tag.label}
+                                  </Typography>
+
                                   <Typography
                                     variant="caption"
                                     color="text.secondary"
                                     sx={{ fontFamily: 'monospace' }}
                                   >
-                                    {(t.weight * 100).toFixed(0)}%
+                                    {(tag.weight * 100).toFixed(0)}%
                                   </Typography>
                                 </Stack>
+
                                 <LinearProgress
                                   variant="determinate"
-                                  value={Math.min(100, t.weight * 100)}
+                                  value={Math.min(100, tag.weight * 100)}
                                   color="primary"
                                   sx={{ height: 6, borderRadius: 3 }}
                                 />
@@ -655,11 +1170,11 @@ function App() {
                       )}
                     </Stack>
                   ) : (
-                    /* Left Column for NEW USER: Shows only what they selected (no fake hours!) */
                     <Paper sx={{ p: 2.5 }}>
                       <Typography variant="h6" sx={{ mb: 0.5 }}>
                         Suas Preferências Atuais
                       </Typography>
+
                       <Typography
                         variant="caption"
                         color="text.secondary"
@@ -669,10 +1184,16 @@ function App() {
                       </Typography>
 
                       {!newUserHasAnyPreference ? (
-                        <Paper sx={{ p: 3, bgcolor: '#121a24', textAlign: 'center' }}>
+                        <Paper
+                          sx={{
+                            p: 3,
+                            bgcolor: '#121a24',
+                            textAlign: 'center',
+                          }}
+                        >
                           <Typography variant="body2" color="text.secondary">
-                            Nenhuma preferência marcada ainda. Clique em um ou mais gêneros acima
-                            para ver sugestões na hora.
+                            Nenhuma preferência marcada ainda. Selecione um ou
+                            mais gêneros acima ou escolha jogos de referência.
                           </Typography>
                         </Paper>
                       ) : (
@@ -682,7 +1203,14 @@ function App() {
                               <Typography variant="subtitle2" sx={{ mb: 1 }}>
                                 Gêneros selecionados ({newUserTags.length})
                               </Typography>
-                              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75 }}>
+
+                              <Box
+                                sx={{
+                                  display: 'flex',
+                                  flexWrap: 'wrap',
+                                  gap: 0.75,
+                                }}
+                              >
                                 {newUserTags.map((tag) => (
                                   <Chip
                                     key={tag}
@@ -701,9 +1229,13 @@ function App() {
                               <Typography variant="subtitle2" sx={{ mb: 1 }}>
                                 Títulos de referência ({newUserRefGames.length})
                               </Typography>
+
                               <Stack spacing={1}>
                                 {newUserRefGames.map((item) => {
-                                  const g = STEAM_CATALOG.find((x) => x.app_id === item.app_id)
+                                  const game = catalogGamesById.get(
+                                    Number(item.app_id)
+                                  )
+
                                   return (
                                     <Paper
                                       key={item.app_id}
@@ -715,21 +1247,42 @@ function App() {
                                         gap: 1.5,
                                       }}
                                     >
-                                      <Box sx={{ width: 72, height: 34, flexShrink: 0 }}>
-                                        <GameCover appId={item.app_id} title={g?.title || ''} />
+                                      <Box
+                                        sx={{
+                                          width: 72,
+                                          height: 34,
+                                          flexShrink: 0,
+                                        }}
+                                      >
+                                        <GameCover
+                                          appId={item.app_id}
+                                          title={game?.title || ''}
+                                        />
                                       </Box>
+
                                       <Box sx={{ flex: 1, minWidth: 0 }}>
-                                        <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap>
-                                          {g?.title || `App #${item.app_id}`}
+                                        <Typography
+                                          variant="body2"
+                                          sx={{ fontWeight: 600 }}
+                                          noWrap
+                                        >
+                                          {game?.title || `App #${item.app_id}`}
                                         </Typography>
-                                        <Typography variant="caption" color="text.secondary">
+
+                                        <Typography
+                                          variant="caption"
+                                          color="text.secondary"
+                                        >
                                           Marcado como interesse
                                         </Typography>
                                       </Box>
+
                                       <IconButton
                                         size="small"
                                         color="error"
-                                        onClick={() => handleRemoveNewUserRefGame(item.app_id)}
+                                        onClick={() =>
+                                          handleRemoveNewUserRefGame(item.app_id)
+                                        }
                                       >
                                         <DeleteOutlineIcon fontSize="small" />
                                       </IconButton>
@@ -745,10 +1298,9 @@ function App() {
                   )}
                 </Grid>
 
-                {/* Right Column: Personalized Recommendations */}
+                {/* Coluna direita: recomendações */}
                 <Grid size={{ xs: 12, lg: 8 }}>
                   <Stack spacing={2}>
-                    {/* Preferences Bar */}
                     <Paper sx={{ px: 2.5, py: 1.75 }}>
                       <Box
                         sx={{
@@ -760,48 +1312,32 @@ function App() {
                         }}
                       >
                         <Box>
-                          <Typography variant="h6">Recomendados Para Você</Typography>
+                          <Typography variant="h6">
+                            Recomendados Para Você
+                          </Typography>
+
                           <Typography variant="caption" color="text.secondary">
                             {userType === 'existing'
-                              ? 'Jogos inéditos na sua biblioteca compatíveis com o seu histórico'
-                              : 'Sugestões baseadas nos gêneros e referências que você escolheu'}
+                              ? 'Jogos inéditos na sua biblioteca, compatíveis com seu histórico'
+                              : 'Sugestões baseadas nos gêneros e jogos que você escolheu'}
                           </Typography>
                         </Box>
 
-                        <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', flexWrap: 'wrap' }}>
-                          {userType === 'existing' && (
-                            <FormControlLabel
-                              control={
-                                <Switch
-                                  size="small"
-                                  checked={useNegativeDislikes}
-                                  onChange={(e) => setUseNegativeDislikes(e.target.checked)}
-                                />
-                              }
-                              label={
-                                <Typography variant="body2">
-                                  Evitar estilo de jogos que não gostei
-                                </Typography>
-                              }
-                            />
-                          )}
-
-                          <FormControlLabel
-                            control={
-                              <Switch
-                                size="small"
-                                checked={useMmr}
-                                onChange={(e) => setUseMmr(e.target.checked)}
-                              />
-                            }
-                            label={<Typography variant="body2">Mais variedade de gêneros</Typography>}
-                          />
-
+                        <Box
+                          sx={{
+                            display: 'flex',
+                            gap: 2,
+                            alignItems: 'center',
+                            flexWrap: 'wrap',
+                          }}
+                        >
                           <ToggleButtonGroup
                             size="small"
                             value={topN}
                             exclusive
-                            onChange={(_, val) => val && setTopN(val)}
+                            onChange={(_, value) => {
+                              if (value) setTopN(value)
+                            }}
                           >
                             <ToggleButton value={5}>Top 5</ToggleButton>
                             <ToggleButton value={10}>Top 10</ToggleButton>
@@ -811,29 +1347,69 @@ function App() {
                       </Box>
                     </Paper>
 
-                    {/* Recommendation Cards */}
-                    {fbcResult.recommendations.length === 0 ? (
+                    {recommendationLoading ? (
+                      <Paper sx={{ p: 6, textAlign: 'center' }}>
+                        <CircularProgress size={32} />
+
+                        <Typography
+                          variant="body2"
+                          color="text.secondary"
+                          sx={{ mt: 2 }}
+                        >
+                          Consultando o motor de recomendação...
+                        </Typography>
+                      </Paper>
+                    ) : recommendationError ? (
+                      <Paper sx={{ p: 4, textAlign: 'center' }}>
+                        <Typography variant="h6" color="error.main" sx={{ mb: 1 }}>
+                          Não foi possível carregar as recomendações
+                        </Typography>
+
+                        <Typography variant="body2" color="text.secondary">
+                          {recommendationError}
+                        </Typography>
+                      </Paper>
+                    ) : userType === 'new' && !newUserHasAnyPreference ? (
                       <Paper sx={{ p: 6, textAlign: 'center' }}>
                         <Typography variant="h6" sx={{ mb: 1 }}>
-                          Escolha pelo menos um gênero acima para começar
+                          Escolha suas preferências para começar
                         </Typography>
+
                         <Typography variant="body2" color="text.secondary">
-                          Assim que você clicar nos gêneros de seu interesse (como RPG, FPS, Terror
-                          ou Estratégia), listaremos aqui os jogos mais compatíveis do catálogo.
+                          Selecione pelo menos um gênero ou jogo de referência.
+                          O sistema calculará recomendações iniciais com base
+                          nessas escolhas.
+                        </Typography>
+                      </Paper>
+                    ) : recommendations.length === 0 ? (
+                      <Paper sx={{ p: 6, textAlign: 'center' }}>
+                        <Typography variant="h6" sx={{ mb: 1 }}>
+                          Nenhuma recomendação disponível
+                        </Typography>
+
+                        <Typography variant="body2" color="text.secondary">
+                          O backend não encontrou jogos elegíveis para os
+                          parâmetros selecionados.
                         </Typography>
                       </Paper>
                     ) : (
-                      fbcResult.recommendations.map((rec) => {
-                        const g = rec.game
-                        const exp = rec.explanation
+                      recommendations.map((rec) => {
+                        const game = rec.game
+                        const explanation = rec.explanation
+
                         return (
                           <Card key={rec.app_id} sx={{ overflow: 'hidden' }}>
                             <Grid container>
                               <Grid size={{ xs: 12, sm: 4, md: 3.6 }}>
-                                <Box sx={{ height: { xs: 165, sm: '100%' }, minHeight: 145 }}>
+                                <Box
+                                  sx={{
+                                    height: { xs: 165, sm: '100%' },
+                                    minHeight: 145,
+                                  }}
+                                >
                                   <GameCover
                                     appId={rec.app_id}
-                                    title={g.title}
+                                    title={game.title}
                                     borderRadius={0}
                                   />
                                 </Box>
@@ -844,21 +1420,30 @@ function App() {
                                   <Stack
                                     direction="row"
                                     spacing={1.5}
-                                    sx={{ justifyContent: 'space-between', alignItems: 'flex-start' }}
+                                    sx={{
+                                      justifyContent: 'space-between',
+                                      alignItems: 'flex-start',
+                                    }}
                                   >
-                                    <Box>
+                                    <Box sx={{ minWidth: 0 }}>
                                       <Typography
                                         variant="h6"
-                                        sx={{ fontSize: '1.05rem', fontWeight: 700 }}
+                                        sx={{
+                                          fontSize: '1.05rem',
+                                          fontWeight: 700,
+                                        }}
                                       >
-                                        {g.title}
+                                        {game.title}
                                       </Typography>
-                                      <Typography variant="caption" color="text.secondary">
-                                        Avaliações: {g.rating} ({g.positive_ratio}%) · Lançamento:{' '}
-                                        {g.date_release} ·{' '}
-                                        {g.price_final === 0
-                                          ? 'Gratuito para Jogar'
-                                          : `$ ${g.price_final.toFixed(2)}`}
+
+                                      <Typography
+                                        variant="caption"
+                                        color="text.secondary"
+                                      >
+                                        Avaliações: {game.rating || 'N/D'} (
+                                        {game.positive_ratio ?? 'N/D'}%) ·
+                                        Lançamento: {game.date_release || 'N/D'} ·{' '}
+                                        {formatPrice(game.price_final)}
                                       </Typography>
                                     </Box>
 
@@ -866,7 +1451,10 @@ function App() {
                                       label={`${(rec.similarity * 100).toFixed(0)}% compatível`}
                                       color="secondary"
                                       size="small"
-                                      sx={{ fontWeight: 700, flexShrink: 0 }}
+                                      sx={{
+                                        fontWeight: 700,
+                                        flexShrink: 0,
+                                      }}
                                     />
                                   </Stack>
 
@@ -882,10 +1470,9 @@ function App() {
                                       overflow: 'hidden',
                                     }}
                                   >
-                                    {g.description}
+                                    {game.description || 'Descrição indisponível.'}
                                   </Typography>
 
-                                  {/* Explanation Box adapted to Existing vs New User */}
                                   <Paper
                                     sx={{
                                       p: 1.5,
@@ -903,55 +1490,76 @@ function App() {
                                         mb: 1,
                                       }}
                                     >
-                                      {userType === 'existing' && exp.mostSimilarConsumed ? (
-                                        <Typography variant="caption" color="text.primary">
+                                      {userType === 'existing' &&
+                                      explanation.mostSimilarConsumed ? (
+                                        <Typography
+                                          variant="caption"
+                                          color="text.primary"
+                                        >
                                           Recomendado porque você jogou{' '}
                                           <Box
                                             component="span"
-                                            sx={{ color: 'primary.main', fontWeight: 600 }}
+                                            sx={{
+                                              color: 'primary.main',
+                                              fontWeight: 600,
+                                            }}
                                           >
-                                            {exp.mostSimilarConsumed.title}
+                                            {explanation.mostSimilarConsumed.title}
                                           </Box>{' '}
-                                          ({exp.mostSimilarConsumed.hours}h)
-                                        </Typography>
-                                      ) : userType === 'new' && exp.mostSimilarConsumed ? (
-                                        <Typography variant="caption" color="text.primary">
-                                          Semelhante ao seu interesse em{' '}
-                                          <Box
-                                            component="span"
-                                            sx={{ color: 'primary.main', fontWeight: 600 }}
-                                          >
-                                            {exp.mostSimilarConsumed.title}
-                                          </Box>
+                                          ({formatNumber(
+                                            explanation.mostSimilarConsumed.hours,
+                                            1
+                                          )}h)
                                         </Typography>
                                       ) : (
-                                        <Typography variant="caption" color="text.primary">
-                                          Combina com os gêneros que você escolheu:
+                                        <Typography
+                                          variant="caption"
+                                          color="text.primary"
+                                        >
+                                          {userType === 'new'
+                                            ? 'Combina com suas preferências iniciais:'
+                                            : 'Compatível com seu perfil de jogador:'}
                                         </Typography>
                                       )}
 
                                       <Button
                                         size="small"
                                         variant="text"
-                                        startIcon={<InfoOutlinedIcon fontSize="small" />}
+                                        startIcon={
+                                          <InfoOutlinedIcon fontSize="small" />
+                                        }
                                         onClick={() => setInspectedRec(rec)}
-                                        sx={{ py: 0, fontSize: '0.74rem' }}
+                                        sx={{
+                                          py: 0,
+                                          fontSize: '0.74rem',
+                                        }}
                                       >
                                         Por que combina comigo?
                                       </Button>
                                     </Box>
 
-                                    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75 }}>
-                                      {exp.matchedTags.slice(0, 5).map((mt) => (
-                                        <Chip
-                                          key={mt.tag}
-                                          label={mt.tag}
-                                          size="small"
-                                          color="primary"
-                                          variant="outlined"
-                                          sx={{ height: 22, fontSize: '0.72rem' }}
-                                        />
-                                      ))}
+                                    <Box
+                                      sx={{
+                                        display: 'flex',
+                                        flexWrap: 'wrap',
+                                        gap: 0.75,
+                                      }}
+                                    >
+                                      {explanation.matchedTags
+                                        .slice(0, 5)
+                                        .map((tag) => (
+                                          <Chip
+                                            key={tag.tag}
+                                            label={tag.tag}
+                                            size="small"
+                                            color="primary"
+                                            variant="outlined"
+                                            sx={{
+                                              height: 22,
+                                              fontSize: '0.72rem',
+                                            }}
+                                          />
+                                        ))}
                                     </Box>
                                   </Paper>
                                 </Box>
@@ -966,7 +1574,7 @@ function App() {
               </Grid>
             </Stack>
           ) : (
-            /* Explore Catalog View */
+            /* Explorar catálogo */
             <Stack spacing={3}>
               <Paper sx={{ p: 2.5 }}>
                 <Grid container spacing={2} sx={{ alignItems: 'center' }}>
@@ -976,132 +1584,253 @@ function App() {
                       size="small"
                       label="Buscar jogo pelo nome ou tema"
                       value={catalogSearch}
-                      onChange={(e) => setCatalogSearch(e.target.value)}
+                      onChange={(event) =>
+                        setCatalogSearch(event.target.value)
+                      }
                     />
                   </Grid>
+
                   <Grid size={{ xs: 12, sm: 6, md: 4 }}>
                     <FormControl fullWidth size="small">
-                      <InputLabel id="tag-filter-label">Filtrar por Gênero / Tag</InputLabel>
+                      <InputLabel id="tag-filter-label">
+                        Filtrar por Gênero / Tag
+                      </InputLabel>
+
                       <Select
                         labelId="tag-filter-label"
                         label="Filtrar por Gênero / Tag"
                         value={catalogTagFilter}
-                        onChange={(e) => setCatalogTagFilter(e.target.value)}
+                        onChange={(event) =>
+                          setCatalogTagFilter(event.target.value)
+                        }
                       >
-                        <MenuItem value="ALL">Todos os Gêneros ({allCatalogTags.length})</MenuItem>
-                        {allCatalogTags.map((t) => (
-                          <MenuItem key={t} value={t}>
-                            {t}
+                        <MenuItem value="ALL">
+                          Todos os Gêneros ({allCatalogTags.length})
+                        </MenuItem>
+
+                        {allCatalogTags.map((tag) => (
+                          <MenuItem key={tag} value={tag}>
+                            {tag}
                           </MenuItem>
                         ))}
                       </Select>
                     </FormControl>
                   </Grid>
+
                   <Grid size={{ xs: 12, sm: 6, md: 2 }}>
                     <Typography variant="caption" color="text.secondary">
-                      {filteredCatalog.length} jogos encontrados
+                      {catalogLoading
+                        ? 'Buscando...'
+                        : `${formatNumber(catalogTotal)} jogos encontrados`}
                     </Typography>
                   </Grid>
                 </Grid>
               </Paper>
 
-              <Grid container spacing={2.5}>
-                {filteredCatalog.map((g) => {
-                  const alreadyInNewProfile = newUserRefGames.some((i) => i.app_id === g.app_id)
-                  return (
-                    <Grid key={g.app_id} size={{ xs: 12, sm: 6, md: 4, lg: 3 }}>
-                      <Card
-                        sx={{
-                          height: '100%',
-                          display: 'flex',
-                          flexDirection: 'column',
-                          justifyContent: 'space-between',
-                        }}
-                      >
-                        <Box>
-                          <Box sx={{ height: 135 }}>
-                            <GameCover appId={g.app_id} title={g.title} borderRadius={0} />
-                          </Box>
-                          <Box sx={{ p: 2 }}>
-                            <Stack
-                              direction="row"
-                              spacing={1}
-                              sx={{ justifyContent: 'space-between', alignItems: 'flex-start' }}
-                            >
-                              <Typography variant="subtitle1" sx={{ fontSize: '0.95rem' }}>
-                                {g.title}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  fontFamily: 'monospace',
-                                  color: 'secondary.main',
-                                  fontWeight: 600,
-                                  whiteSpace: 'nowrap',
-                                }}
-                              >
-                                {g.price_final === 0 ? 'Gratuito' : `$${g.price_final}`}
-                              </Typography>
-                            </Stack>
-                            <Typography
-                              variant="caption"
-                              color="text.secondary"
-                              sx={{ display: 'block', mb: 1 }}
-                            >
-                              {g.rating} ({g.positive_ratio}%)
-                            </Typography>
-                            <Typography
-                              variant="body2"
-                              color="text.secondary"
-                              sx={{
-                                mb: 1.5,
-                                display: '-webkit-box',
-                                WebkitLineClamp: 2,
-                                WebkitBoxOrient: 'vertical',
-                                overflow: 'hidden',
-                              }}
-                            >
-                              {g.description}
-                            </Typography>
-                            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
-                              {(g.tags || []).slice(0, 4).map((t) => (
-                                <Chip
-                                  key={t}
-                                  label={t}
-                                  size="small"
-                                  sx={{ height: 20, fontSize: '0.68rem' }}
-                                />
-                              ))}
-                            </Box>
-                          </Box>
-                        </Box>
+              {catalogError && (
+                <Paper
+                  sx={{
+                    p: 2,
+                    bgcolor: 'rgba(211, 47, 47, 0.10)',
+                    border: '1px solid',
+                    borderColor: 'error.dark',
+                  }}
+                >
+                  <Typography variant="body2" color="error.light">
+                    {catalogError}
+                  </Typography>
+                </Paper>
+              )}
 
-                        <Box sx={{ px: 2, pb: 2 }}>
-                          <Button
-                            fullWidth
-                            size="small"
-                            variant={alreadyInNewProfile ? 'contained' : 'outlined'}
-                            onClick={() => {
-                              handleAddRefGameToNewUser(g.app_id)
-                              setUserType('new')
-                              setPageView('forYou')
+              {catalogLoading ? (
+                <Box sx={{ py: 6, textAlign: 'center' }}>
+                  <CircularProgress />
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    sx={{ mt: 2 }}
+                  >
+                    Carregando catálogo do banco de dados...
+                  </Typography>
+                </Box>
+              ) : catalogGames.length === 0 ? (
+                <Paper sx={{ p: 5, textAlign: 'center' }}>
+                  <Typography variant="h6">
+                    Nenhum jogo encontrado
+                  </Typography>
+
+                  <Typography variant="body2" color="text.secondary">
+                    Tente alterar o termo de busca ou o filtro selecionado.
+                  </Typography>
+                </Paper>
+              ) : (
+                <>
+                  <Grid container spacing={2.5}>
+                    {catalogGames.map((game) => {
+                      const alreadySelected = newUserRefGames.some(
+                        (item) =>
+                          Number(item.app_id) === Number(game.app_id)
+                      )
+
+                      return (
+                        <Grid
+                          key={game.app_id}
+                          size={{ xs: 12, sm: 6, md: 4, lg: 3 }}
+                        >
+                          <Card
+                            sx={{
+                              height: '100%',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              justifyContent: 'space-between',
                             }}
                           >
-                            {alreadyInNewProfile
-                              ? 'Marcado como interesse'
-                              : 'Tenho interesse neste jogo'}
-                          </Button>
-                        </Box>
-                      </Card>
-                    </Grid>
-                  )
-                })}
-              </Grid>
+                            <Box>
+                              <Box sx={{ height: 135 }}>
+                                <GameCover
+                                  appId={game.app_id}
+                                  title={game.title}
+                                  borderRadius={0}
+                                />
+                              </Box>
+
+                              <Box sx={{ p: 2 }}>
+                                <Stack
+                                  direction="row"
+                                  spacing={1}
+                                  sx={{
+                                    justifyContent: 'space-between',
+                                    alignItems: 'flex-start',
+                                  }}
+                                >
+                                  <Typography
+                                    variant="subtitle1"
+                                    sx={{ fontSize: '0.95rem' }}
+                                  >
+                                    {game.title}
+                                  </Typography>
+
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      fontFamily: 'monospace',
+                                      color: 'secondary.main',
+                                      fontWeight: 600,
+                                      whiteSpace: 'nowrap',
+                                    }}
+                                  >
+                                    {game.price_final === 0
+                                      ? 'Gratuito'
+                                      : formatPrice(game.price_final)}
+                                  </Typography>
+                                </Stack>
+
+                                <Typography
+                                  variant="caption"
+                                  color="text.secondary"
+                                  sx={{ display: 'block', mb: 1 }}
+                                >
+                                  {game.rating || 'N/D'} (
+                                  {game.positive_ratio ?? 'N/D'}%)
+                                </Typography>
+
+                                <Typography
+                                  variant="body2"
+                                  color="text.secondary"
+                                  sx={{
+                                    mb: 1.5,
+                                    display: '-webkit-box',
+                                    WebkitLineClamp: 2,
+                                    WebkitBoxOrient: 'vertical',
+                                    overflow: 'hidden',
+                                  }}
+                                >
+                                  {game.description || 'Descrição indisponível.'}
+                                </Typography>
+
+                                <Box
+                                  sx={{
+                                    display: 'flex',
+                                    flexWrap: 'wrap',
+                                    gap: 0.5,
+                                  }}
+                                >
+                                  {(game.tags || []).slice(0, 4).map((tag) => (
+                                    <Chip
+                                      key={tag}
+                                      label={tag}
+                                      size="small"
+                                      sx={{
+                                        height: 20,
+                                        fontSize: '0.68rem',
+                                      }}
+                                    />
+                                  ))}
+                                </Box>
+                              </Box>
+                            </Box>
+
+                            <Box sx={{ px: 2, pb: 2 }}>
+                              <Button
+                                fullWidth
+                                size="small"
+                                variant={
+                                  alreadySelected ? 'contained' : 'outlined'
+                                }
+                                disabled={
+                                  alreadySelected ||
+                                  newUserRefGames.length >= 20
+                                }
+                                onClick={() => {
+                                  handleAddRefGameToNewUser(game.app_id)
+                                  setUserType('new')
+                                  setPageView('forYou')
+                                }}
+                              >
+                                {alreadySelected
+                                  ? 'Marcado como interesse'
+                                  : 'Tenho interesse neste jogo'}
+                              </Button>
+                            </Box>
+                          </Card>
+                        </Grid>
+                      )
+                    })}
+                  </Grid>
+
+                  {catalogHasMore && (
+                    <Box sx={{ display: 'flex', justifyContent: 'center', py: 2 }}>
+                      <Button
+                        variant="outlined"
+                        onClick={handleLoadMoreCatalog}
+                        disabled={catalogLoadingMore}
+                      >
+                        {catalogLoadingMore ? (
+                          <CircularProgress size={20} />
+                        ) : (
+                          'Carregar mais jogos'
+                        )}
+                      </Button>
+                    </Box>
+                  )}
+
+                  {!catalogHasMore && catalogGames.length > 0 && (
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      textAlign="center"
+                    >
+                      Todos os {formatNumber(catalogTotal)} resultados desta
+                      pesquisa foram carregados.
+                    </Typography>
+                  )}
+                </>
+              )}
             </Stack>
           )}
         </Container>
 
-        {/* Explanation Details Dialog */}
+        {/* Dialog de explicação */}
         <Dialog
           open={Boolean(inspectedRec)}
           onClose={() => setInspectedRec(null)}
@@ -1123,11 +1852,18 @@ function App() {
                   <Typography variant="h6">
                     Por que recomendamos {inspectedRec.game.title}?
                   </Typography>
+
                   <Typography variant="caption" color="text.secondary">
-                    Índice de compatibilidade: {(inspectedRec.similarity * 100).toFixed(1)}% (Similaridade do Cosseno)
+                    Índice de compatibilidade:{' '}
+                    {(inspectedRec.similarity * 100).toFixed(1)}%
+                    {' '}(Similaridade do Cosseno)
                   </Typography>
                 </Box>
-                <IconButton size="small" onClick={() => setInspectedRec(null)}>
+
+                <IconButton
+                  size="small"
+                  onClick={() => setInspectedRec(null)}
+                >
                   <CloseIcon fontSize="small" />
                 </IconButton>
               </DialogTitle>
@@ -1141,14 +1877,23 @@ function App() {
                           ? 'Jogo mais parecido na sua biblioteca'
                           : 'Título de referência mais próximo'}
                       </Typography>
+
                       <Typography variant="body2">
-                        <strong>{inspectedRec.explanation.mostSimilarConsumed.title}</strong>
+                        <strong>
+                          {inspectedRec.explanation.mostSimilarConsumed.title}
+                        </strong>
+
                         {userType === 'existing' &&
-                          ` (${inspectedRec.explanation.mostSimilarConsumed.hours}h jogadas)`}{' '}
+                          ` (${formatNumber(
+                            inspectedRec.explanation.mostSimilarConsumed.hours,
+                            1
+                          )}h jogadas)`}{' '}
+
                         tem{' '}
                         <strong>
                           {(
-                            inspectedRec.explanation.mostSimilarConsumed.itemSimilarity * 100
+                            inspectedRec.explanation.mostSimilarConsumed
+                              .itemSimilarity * 100
                           ).toFixed(0)}
                           %
                         </strong>{' '}
@@ -1159,32 +1904,55 @@ function App() {
 
                   <Grid container spacing={1.5}>
                     <Grid size={{ xs: 4 }}>
-                      <Paper sx={{ p: 1.5, bgcolor: '#121a24', textAlign: 'center' }}>
+                      <Paper
+                        sx={{
+                          p: 1.5,
+                          bgcolor: '#121a24',
+                          textAlign: 'center',
+                        }}
+                      >
                         <Typography variant="caption" color="text.secondary">
                           Gêneros / Tags
                         </Typography>
+
                         <Typography variant="h6" color="primary.main">
-                          {inspectedRec.explanation.breakdown.tagsPct}%
+                          {inspectedRec.explanation.breakdown.tagsPct.toFixed(1)}%
                         </Typography>
                       </Paper>
                     </Grid>
+
                     <Grid size={{ xs: 4 }}>
-                      <Paper sx={{ p: 1.5, bgcolor: '#121a24', textAlign: 'center' }}>
+                      <Paper
+                        sx={{
+                          p: 1.5,
+                          bgcolor: '#121a24',
+                          textAlign: 'center',
+                        }}
+                      >
                         <Typography variant="caption" color="text.secondary">
                           Temas na Sinopse
                         </Typography>
+
                         <Typography variant="h6" color="secondary.main">
-                          {inspectedRec.explanation.breakdown.tfidfPct}%
+                          {inspectedRec.explanation.breakdown.tfidfPct.toFixed(1)}%
                         </Typography>
                       </Paper>
                     </Grid>
+
                     <Grid size={{ xs: 4 }}>
-                      <Paper sx={{ p: 1.5, bgcolor: '#121a24', textAlign: 'center' }}>
+                      <Paper
+                        sx={{
+                          p: 1.5,
+                          bgcolor: '#121a24',
+                          textAlign: 'center',
+                        }}
+                      >
                         <Typography variant="caption" color="text.secondary">
                           Avaliação / Preço
                         </Typography>
+
                         <Typography variant="h6">
-                          {inspectedRec.explanation.breakdown.numPct}%
+                          {inspectedRec.explanation.breakdown.numPct.toFixed(1)}%
                         </Typography>
                       </Paper>
                     </Grid>
@@ -1195,32 +1963,71 @@ function App() {
                       <TableRow>
                         <TableCell>Característica em comum</TableCell>
                         <TableCell>Origem</TableCell>
-                        <TableCell align="right">Peso na recomendação</TableCell>
+                        <TableCell align="right">
+                          Peso na recomendação
+                        </TableCell>
                       </TableRow>
                     </TableHead>
+
                     <TableBody>
-                      {inspectedRec.explanation.matchedTags.map((t) => (
-                        <TableRow key={`tag-${t.tag}`}>
-                          <TableCell sx={{ color: 'primary.main', fontWeight: 500 }}>
-                            {t.tag}
+                      {inspectedRec.explanation.matchedTags.map((tag) => (
+                        <TableRow key={`tag-${tag.tag}`}>
+                          <TableCell
+                            sx={{
+                              color: 'primary.main',
+                              fontWeight: 500,
+                            }}
+                          >
+                            {tag.tag}
                           </TableCell>
+
                           <TableCell>Gênero / Tag</TableCell>
-                          <TableCell align="right" sx={{ fontFamily: 'monospace' }}>
-                            +{(t.contribution * 100).toFixed(1)}%
+
+                          <TableCell
+                            align="right"
+                            sx={{ fontFamily: 'monospace' }}
+                          >
+                            +{(tag.contribution * 100).toFixed(1)}%
                           </TableCell>
                         </TableRow>
                       ))}
+
                       {inspectedRec.explanation.matchedTerms.map((term) => (
                         <TableRow key={`tfidf-${term.term}`}>
-                          <TableCell sx={{ color: 'secondary.main', fontFamily: 'monospace' }}>
+                          <TableCell
+                            sx={{
+                              color: 'secondary.main',
+                              fontFamily: 'monospace',
+                            }}
+                          >
                             {term.term}
                           </TableCell>
+
                           <TableCell>Termo na sinopse (TF-IDF)</TableCell>
-                          <TableCell align="right" sx={{ fontFamily: 'monospace' }}>
+
+                          <TableCell
+                            align="right"
+                            sx={{ fontFamily: 'monospace' }}
+                          >
                             +{(term.contribution * 100).toFixed(1)}%
                           </TableCell>
                         </TableRow>
                       ))}
+
+                      {inspectedRec.explanation.matchedTags.length === 0 &&
+                        inspectedRec.explanation.matchedTerms.length === 0 && (
+                          <TableRow>
+                            <TableCell colSpan={3}>
+                              <Typography
+                                variant="body2"
+                                color="text.secondary"
+                              >
+                                O backend não retornou contribuições individuais
+                                para esta recomendação.
+                              </Typography>
+                            </TableCell>
+                          </TableRow>
+                        )}
                     </TableBody>
                   </Table>
                 </Stack>
@@ -1229,7 +2036,7 @@ function App() {
           )}
         </Dialog>
 
-        {/* Footer */}
+        {/* Rodapé */}
         <Box
           component="footer"
           sx={{
@@ -1245,13 +2052,22 @@ function App() {
             <Stack
               direction={{ xs: 'column', sm: 'row' }}
               spacing={1}
-              sx={{ justifyContent: 'space-between', alignItems: 'center' }}
+              sx={{
+                justifyContent: 'space-between',
+                alignItems: 'center',
+              }}
             >
               <Typography variant="caption" color="text.secondary">
                 O Que Temos Hoje? — Recomendações personalizadas de jogos
               </Typography>
-              <Typography variant="caption" color="text.secondary">
-                {apiOnline ? 'Conectado ao servidor FastAPI' : 'Modo demonstração local'}
+
+              <Typography
+                variant="caption"
+                color={apiOnline ? 'success.main' : 'error.main'}
+              >
+                {apiOnline
+                  ? 'Conectado ao servidor FastAPI'
+                  : 'Backend indisponível'}
               </Typography>
             </Stack>
           </Container>
