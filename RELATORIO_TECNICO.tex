@@ -1,0 +1,249 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazilian]{babel}
+\usepackage[left=3cm,right=2cm,top=3cm,bottom=2cm]{geometry}
+\usepackage{amsmath} % Necessário para o comando \text{} nas equações
+\usepackage{setspace}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{float}
+\usepackage{multicol}
+\usepackage{indentfirst}
+\usepackage{hyperref} % Deve ser carregado por último
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,
+    urlcolor=blue,
+    citecolor=blue,
+}
+
+\onehalfspacing % Forma correta de aplicar espaçamento 1,5 usando o pacote setspace
+
+\begin{document}
+
+\begin{titlepage}
+\centering
+\vspace*{1cm}
+{\large UNIVERSIDADE DO ESTADO DO AMAZONAS}\\[0.3cm]
+{\large SISTEMAS DE INFORMAÇÃO}
+
+\vspace{3.5cm}
+{\LARGE\bfseries Relatório Técnico\\[0.4cm]
+O Que Temos Hoje? —\\[0.2cm]
+Recomendador de Jogos Steam por Filtragem Baseada em Conteúdo}
+
+\vspace{3cm}
+\begin{tabular}{rl}
+{\large \textbf{Autores:}} & Erick Roberto \\
+& Júlio Cleiton \\
+& Thaís Carolina \\
+& Victor Andrews \\
+\end{tabular}
+
+\vfill
+{\large Manaus\\
+2026}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\section{Introdução}
+
+Este relatório técnico documenta a aplicação das técnicas de Filtragem Baseada em Conteúdo (FBC) no sistema \textit{O Que Temos Hoje?}, um recomendador de jogos da Steam. O sistema recomenda jogos com base nas características dos próprios itens (descrições, tags e atributos numéricos) e no histórico de interações do usuário, sem depender das avaliações de outros usuários.
+
+O documento apresenta: (i) a vetorização dos jogos e a construção do perfil de usuário; (ii) o tratamento e análise exploratória dos dados; (iii) a ingestão dos dados brutos para o banco de dados SQLite; (iv) a exposição do recomendador por meio de uma API FastAPI e de um frontend em React com Material UI; e (v) os resultados dos testes da aplicação e do modelo, com uma breve conclusão.
+
+\section{Vetorização e Modelo de Recomendação}
+
+A vetorização transforma cada jogo em um vetor de características esparsas e constrói um perfil de usuário a partir do seu histórico de interações. A recomendação é feita por similaridade do cosseno entre o perfil do usuário e os jogos não consumidos.
+
+\subsection{Construção dos vetores de itens}
+
+Cada jogo é representado pela concatenação de três grupos de características, cada um com seu próprio peso:
+
+\begin{itemize}
+    \item \textbf{Descrição (peso 1,0):} o campo de descrição do jogo é limpo (minúsculas, tokenização, remoção de stopwords em português e inglês, stemming com Snowball) e vetorizado com TF-IDF (uni-gramas e bi-gramas, até 5.000 features, normalização L2 por linha).
+    \item \textbf{Tags (peso 1,0):} as tags do jogo são representadas como vetor multi-hot (uma coluna por tag presente no catálogo), normalizado L2 por linha.
+    \item \textbf{Atributos numéricos (peso 0,3):} \texttt{price\_final} e \texttt{discount} são normalizados com \texttt{MinMaxScaler} no intervalo $[0,1]$. Atributos de popularidade (\texttt{positive\_ratio} e \texttt{user\_reviews}) são excluídos para evitar viés de popularidade.
+\end{itemize}
+
+A matriz final de itens é a concatenação horizontal dos três grupos, com cada grupo escalado pelo seu respectivo peso. A função \texttt{build\_item\_vectors} (\texttt{recommender/src/data/preprocess.py}) valida a unicidade de \texttt{app\_id}, realiza o \emph{merge} entre o catálogo e os metadados, e garante a consistência entre linhas da matriz, \texttt{app\_ids} e nomes das features.
+
+\subsection{Perfil de usuário}
+
+O perfil de cada usuário é construído a partir de suas interações históricas, separando preferências positivas (jogos recomendados) e negativas (jogos não recomendados). A fórmula utilizada é:
+
+\begin{equation}
+    \text{profile} = \text{positive\_profile} - 0,5 \times \text{negative\_profile}
+\end{equation}
+
+Cada sub-perfil é uma média ponderada dos vetores dos jogos, onde o peso de cada interação é dado por:
+
+\begin{equation}
+    w = 1 + \log(1 + \text{horas jogadas})
+\end{equation}
+
+O crescimento logarítmico evita que quantidades muito altas de horas dominem o perfil. Jogos consumidos que não estão no catálogo de características são marcados como consumidos, mas não participam da construção do perfil. Se não houver avaliações positivas válidas, o perfil não é construído.
+
+\subsection{Recomendação Top-N}
+
+Dado o perfil do usuário, o recomendador calcula a similaridade do cosseno entre o perfil e todos os jogos da matriz de itens. Os jogos já consumidos pelo usuário são excluídos do ranking. Os \textit{N} jogos mais similares são retornados como recomendação, cada um com sua explicação (jogo do histórico mais similar, tags e termos em comum, contribuição de cada grupo de características).
+
+O sistema também suporta recomendações \textit{cold-start} para usuários sem histórico, a partir de jogos de referência e tags selecionadas pelo usuário, sem criar interações fictícias.
+
+\section{Tratamento e Análise Exploratória dos Dados}
+
+\subsection{Pré-processamento de texto}
+
+A limpeza de texto (\texttt{clean\_text}) converte o texto para minúsculas, aplica tokenização (\texttt{word\_tokenize} com \texttt{preserve\_line=True} para evitar dependência de recursos \texttt{punkt}), remove stopwords em português e inglês, mantém apenas tokens alfabéticos e aplica stemming com \texttt{SnowballStemmer} (inglês). O resultado é uma string de tokens separados por espaço, pronta para vetorização.
+
+Tags são normalizadas pela função \texttt{\_normalize\_tags}, que aceita listas, tuplas, strings JSON ou strings separadas por pipe (\texttt{|}), removendo valores nulos e vazios.
+
+\subsection{Análise exploratória de dados (EDA)}
+
+O script \texttt{notebooks/eda.py} (e seu equivalente \texttt{notebooks/eda.ipynb}) executa a análise exploratória sobre o banco SQLite, gerando o resumo em \texttt{notebooks/eda\_resumo.txt}. A EDA cobre:
+
+\begin{itemize}
+    \item Volume de registros por tabela (\texttt{games}, \texttt{users}, \texttt{recommendations}, \texttt{game\_metadata}).
+    \item Estatísticas descritivas dos atributos numéricos dos jogos (\texttt{price\_final}, \texttt{discount}, \texttt{positive\_ratio}, \texttt{user\_reviews}).
+    \item Qualidade dos metadados: quantidade de jogos com descrição e/ou tags preenchidas.
+    \item Tags mais frequentes no catálogo.
+    \item Sparsidade do histórico: média e mediana de jogos por usuário no histórico de recomendações.
+\end{itemize}
+
+Essa análise fundamenta as decisões de pré-processamento, como a exclusão de atributos de popularidade e o tratamento de valores ausentes nas descrições e tags.
+
+\section{Banco de Dados}
+
+Os dados brutos (CSV e JSONL) em \texttt{data/raw/} são importados para um banco SQLite em \texttt{data/steam.db} pelo script \texttt{scripts/import\_steam\_db.py}.
+
+\subsection{Estrutura do banco}
+
+O banco contém quatro tabelas:
+
+\begin{itemize}
+    \item \textbf{games:} catálogo de jogos (\texttt{app\_id}, \texttt{title}, \texttt{date\_release}, \texttt{win}, \texttt{mac}, \texttt{linux}, \texttt{rating}, \texttt{positive\_ratio}, \texttt{user\_reviews}, \texttt{price\_final}, \texttt{price\_original}, \texttt{discount}, \texttt{steam\_deck}).
+    \item \textbf{users:} usuários (\texttt{user\_id}, \texttt{products}, \texttt{reviews}).
+    \item \textbf{recommendations:} histórico de interações (\texttt{review\_id}, \texttt{app\_id}, \texttt{user\_id}, \texttt{helpful}, \texttt{funny}, \texttt{date}, \texttt{is\_recommended}, \texttt{hours}).
+    \item \textbf{game\_metadata:} metadados de conteúdo (\texttt{app\_id}, \texttt{description}, \texttt{tags}).
+\end{itemize}
+
+Todas as tabelas possuem chave primária definida e as tabelas \texttt{recommendations} e \texttt{game\_metadata} possuem chaves estrangeiras referenciando \texttt{games} (e \texttt{users} no caso de \texttt{recommendations}).
+
+\subsection{Processo de importação}
+
+A importação respeita a ordem das chaves estrangeiras (\texttt{games}, depois \texttt{users}, depois \texttt{recommendations}, depois \texttt{game\_metadata}). Os CSVs são lidos com cabeçalho normalizado (minúsculas, espaços substituídos por underline) e valores convertidos conforme o tipo esperado (inteiro, real, booleano, texto). Valores ausentes são tratados como \texttt{NULL}. A inserção utiliza \emph{UPSERT} (\texttt{INSERT ... ON CONFLICT ... DO UPDATE}), de modo que reexecuções atualizam registros existentes em vez de duplicá-los.
+
+Os metadados em JSONL são lidos linha a linha, com validação de integridade referencial (somente jogos existentes em \texttt{games} recebem metadados). Índices são criados em \texttt{recommendations(app\_id)} e \texttt{recommendations(user\_id)} para acelerar consultas por usuário e por jogo. Ao final, é executada a verificação de integridade referencial (\texttt{PRAGMA foreign\_key\_check}).
+
+\subsection{Resultados da análise exploratória}
+
+O script \texttt{notebooks/eda.py} foi executado diretamente sobre os arquivos CSV e JSONL brutos com pandas, gerando o resumo em \texttt{notebooks/eda\_resumo.txt}. Os principais resultados são apresentados abaixo.
+
+\textbf{Volume de registros:} o dataset contém 50.872 jogos, 14.306.064 usuários, 16.967.171 recomendações e 50.872 registros de metadados.
+
+\textbf{Estatísticas descritivas dos atributos numéricos:} o preço final médio é de R\$ 8,62 (mediana R\$ 4,99, máximo R\$ 299,99). O desconto médio é de 5,59\% (mediana 0\%, máximo 90\%). A avaliação positiva média é de 77,05\% (mediana 81\%). O número de avaliações por jogo tem média de 1.824,42, mas mediana de apenas 49, com desvio padrão de 40.073,52 e máximo de 7.494.460, evidenciando grande assimetria e justificando a exclusão de atributos de popularidade do perfil de usuário.
+
+\textbf{Qualidade dos metadados:} todos os 50.872 jogos possuem entrada em \texttt{game\_metadata}. Destes, 40.499 (79,6\%) têm descrição preenchida e 49.628 (97,6\%) possuem tags.
+
+\textbf{Tags mais frequentes:} as tags mais comuns no catálogo são Indie (27.957), Singleplayer (22.566), Action (21.897), Adventure (20.183) e Casual (17.844).
+
+\textbf{Sparsidade do histórico:} 8.247.765 usuários possuem pelo menos uma recomendação registrada. A média de jogos por usuário é de 2,06, com mediana de 1, confirmando que o histórico de interações é altamente esparso.
+
+\section{Frontend e Serviço de API}
+
+\subsection{Backend (FastAPI)}
+
+O backend é implementado em Python com FastAPI (\texttt{recommender/src/api/main.py}). Na inicialização (\texttt{lifespan}), o catálogo, os metadados e o modelo FBC são carregados uma única vez em memória: os dados vêm do SQLite, a matriz de características é construída com \texttt{build\_item\_vectors} e o \texttt{ContentBasedRecommender} é instanciado.
+
+A API expõe os seguintes endpoints:
+
+\begin{itemize}
+    \item \texttt{GET /health} — verifica se a API e o modelo estão ativos, retornando o número de jogos indexados e de interações disponíveis.
+    \item \texttt{GET /games} — catálogo paginado, com busca por título/descrição e filtro por tag.
+    \item \texttt{GET /tags} — lista de todas as tags disponíveis no catálogo.
+    \item \texttt{GET /users/search} — busca exata de usuário por ID ou listagem paginada com cursor (\emph{keyset pagination}).
+    \item \texttt{GET /users/\{user\_id\}/recommendations} — recomendações Top-N personalizadas para um usuário, com opção de excluir itens já consumidos. Retorna o perfil do usuário e a explicação de cada recomendação.
+    \item \texttt{POST /recommendations/cold-start} — recomendações para novos usuários sem histórico, a partir de jogos de referência e tags selecionadas.
+\end{itemize}
+
+O CORS está configurado para permitir requisições do frontend rodando em \texttt{localhost:5173} e \texttt{localhost:3000}. Valores do Pandas/NumPy são convertidos para tipos compatíveis com JSON antes do envio.
+
+\subsection{Frontend (React + Material UI)}
+
+O frontend é uma aplicação React construída com Vite e estilizada com Material UI (\texttt{frontend/src/}). A camada de integração com a API está em \texttt{frontend/src/services/api.js}, que define:
+
+\begin{itemize}
+    \item \texttt{DEFAULT\_API\_URL} apontando para \texttt{http://localhost:8000} (configurável via variável de ambiente \texttt{VITE\_API\_URL}).
+    \item \texttt{fetchWithTimeout} com timeout de 10 segundos e controle de \emph{abort} para evitar requisições pendentes indefinidamente.
+    \item Seis funções de requisição que mapeiam diretamente para os endpoints do backend: verificação de saúde, catálogo paginado, listagem de tags, busca de usuários, recomendações personalizadas e recomendações \textit{cold-start}.
+\end{itemize}
+
+A aplicação principal (\texttt{frontend/src/App.jsx}) consome a API, normaliza os nomes de campos do formato \textit{snake\_case} do backend para \textit{camelCase} do frontend, e exibe o catálogo, as recomendações e os diálogos de explicação (jogo mais similar do histórico, tags e termos correspondentes, detalhamento da contribuição de cada característica). O componente \texttt{EvaluationTab} exibe os resultados da avaliação offline e \texttt{PipelineTab} mostra o estado do pipeline de preparação de dados.
+
+\section{Resultados dos Testes}
+
+\subsection{Testes automatizados da aplicação}
+
+A suíte de testes em \texttt{recommender/tests/} é executada com \texttt{pytest} e cobre o avaliador, o pipeline de dados e o recomendador. Os testes validam:
+
+\begin{itemize}
+    \item Cálculo de Precision@N, Recall@N e nDCG@N.
+    \item Funcionamento dos baselines de popularidade e aleatório.
+    \item Exclusão de itens consumidos nas recomendações.
+    \item Carregamento de dados do SQLite e construção da matriz de itens.
+    \item Construção de perfis de usuário e geração de recomendações Top-N.
+    \item Recomendações \textit{cold-start} e explicações.
+\end{itemize}
+
+Todos os 13 testes da suíte passam com sucesso.
+
+\subsection{Avaliação offline do modelo}
+
+A avaliação offline (\texttt{recommender/scripts/evaluate.py}) segue o protocolo de treino/teste com divisão temporal por usuário (ou fallback aleatório com semente fixa 42), \texttt{test\_size=0.2} e \texttt{min\_interactions=5}. As métricas são calculadas somente sobre itens positivos no teste, excluindo itens consumidos no treino. Os baselines são popularidade (itens mais positivos no treino) e aleatório (amostragem sem reposição do catálogo).
+
+Foram avaliados 100 usuários, com 996 interações de treino e 246 de teste. Os resultados são apresentados na Tabela \ref{tab:avaliacao}.
+
+\begin{table}[H]
+\centering
+\caption{Resultados da avaliação offline (100 usuários).}
+\label{tab:avaliacao}
+\begin{tabular}{lccccc}
+\toprule
+Modelo & Top-N & Precision & Recall & nDCG & Cobertura \\
+\midrule
+FBC & 5 & 0,0089 & 0,0048 & 0,0099 & 0,0073 \\
+Popularidade & 5 & 0,0044 & 0,0120 & 0,0059 & — \\
+Aleatório & 5 & 0,0000 & 0,0000 & 0,0000 & — \\
+\midrule
+FBC & 10 & 0,0056 & 0,0055 & 0,0082 & 0,0073 \\
+Popularidade & 10 & 0,0033 & 0,0231 & 0,0087 & — \\
+Aleatório & 10 & 0,0000 & 0,0000 & 0,0000 & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Interpretação dos resultados:
+
+\begin{itemize}
+    \item \textbf{FBC vs Popularidade:} o FBC apresenta precisão e nDCG superiores à popularidade em ambos os cortes (Top-5 e Top-10), indicando que as recomendações são mais alinhadas ao perfil individual do usuário. A popularidade vence em recall porque recomenda itens gerais que aparecem com mais frequência no teste.
+    \item \textbf{FBC vs Aleatório:} o FBC supera claramente o baseline aleatório em todas as métricas, confirmando que o modelo captura sinal de preferência real.
+    \item \textbf{Cobertura:} baixa ($\approx 0,73\%$ do catálogo), esperada em sistemas de conteúdo com catálogo grande e histórico esparso.
+    \item \textbf{Valores absolutos:} métricas em torno de 0,01 são típicas de recomendações de itens long-tail com histórico esparso e poucos itens relevantes por usuário no teste.
+\end{itemize}
+
+\section{Conclusão}
+
+Este relatório documentou a aplicação completa das técnicas de Filtragem Baseada em Conteúdo no sistema \textit{O Que Temos Hoje?}. A vetorização combina TF-IDF sobre descrições, multi-hot de tags e atributos numéricos normalizados, com pesos diferenciados por grupo. O perfil de usuário é construído a partir de preferências positivas e negativas ponderadas pelo tempo de jogo, e a recomendação é feita por similaridade do cosseno com exclusão de itens consumidos.
+
+O tratamento dos dados inclui limpeza de texto (stopwords em português e inglês, stemming), normalização de atributos numéricos e análise exploratória que fundamenta as decisões de modelagem. A ingestão dos dados brutos para o SQLite utiliza importação em lotes com UPSERT, chaves estrangeiras e índices para consultas eficientes. O recomendador é exposto por uma API FastAPI com endpoints para catálogo, usuários, recomendações personalizadas e cold-start, consumida por um frontend em React com Material UI.
+
+Os testes automatizados (13 casos) passam com sucesso, e a avaliação offline mostra que o FBC supera os baselines de popularidade e aleatório em precisão e nDCG, confirmando que o modelo captura sinal de preferência real. Apesar dos valores absolutos modestos, típicos de catálogos grandes e históricos esparsos, o sistema cumpre os requisitos do pipeline de FBC: representação vetorial, perfil de usuário, similaridade do cosseno, recomendação Top-N e explicabilidade.
+
+\end{document}

@@ -1,135 +1,110 @@
-# Recomendação FBC — Filtragem Baseada em Conteúdo
+# O Que Temos Hoje? — Recomendador de Jogos Steam
 
-Sistema de recomendação de jogos (Steam) baseado em TF-IDF + similaridade do cosseno.
+Sistema de recomendação por **Filtragem Baseada em Conteúdo (FBC)** para jogos
+da Steam. Combina TF-IDF sobre descrições, multi-hot de tags e atributos
+numéricos para construir perfis de usuário e gerar recomendações Top-N por
+similaridade do cosseno, com explicações das características combinadas.
 
-## Stack
+## Estrutura do repositório
 
-- **Backend**: FastAPI (Python) — expõe a API de recomendações e serve o modelo de filtragem baseada em conteúdo.
-- **Frontend**: React — interface de demonstração que consome a API do FastAPI.
-- **Engine de recomendação**: Python (pandas, scikit-learn, numpy, nltk) — TF-IDF + similaridade do cosseno.
-
-## Estrutura do Projeto
-
-```text
-O-que-temos-hoje/
-├── data/                        # Diretório de dados (ignorado pelo Git)
-│   ├── raw/                     # Dados brutos da Steam (games.csv, games_metadata.json, users.csv, recommendations.csv)
-│   └── processed/               # Artefatos e matrizes processadas geradas pelo pipeline
-│
-├── recommender/                 # Projeto Python (uv) — Motor de recomendação, avaliação e API
-│   ├── src/
-│   │   ├── data/                # Engenharia de dados: carregamento (loader.py), limpeza (preprocess.py) e pipeline (pipeline.py)
-│   │   ├── models/              # Modelo FBC: perfil do usuário, similaridade do cosseno e ranking Top-N (recommender.py)
-│   │   ├── evaluation/          # Avaliação experimental: treino/teste, Precision@N, Recall@N, nDCG@N, baselines e cobertura (evaluator.py)
-│   │   └── api/                 # Backend FastAPI (rotas e integração com o recomendador)
-│   ├── tests/                   # Testes automatizados com pytest (test_pipeline.py, test_recommender.py, test_evaluator.py)
-│   ├── pyproject.toml           # Configuração e dependências do ambiente Python
-│   └── uv.lock                  # Lockfile de dependências do uv
-│
-├── frontend/                    # Projeto React — Interface visual de demonstração e explicabilidade
-│   ├── public/                  # Arquivos estáticos
-│   ├── src/                     # Componentes, páginas e serviços de consumo da API
-│   └── package.json             # Dependências e scripts do frontend
-│
-├── INSTRUCOES.md                # Especificação e requisitos acadêmicos do trabalho
-└── README.md                    # Documentação principal do repositório
+```
+.
+├── data/                 # Dados brutos (CSV/JSONL) e banco SQLite gerado
+│   ├── raw/              # games.csv, users.csv, recommendations.csv, games_metadata.json
+│   └── steam.db          # Banco SQLite (gerado por scripts/import_steam_db.py)
+├── frontend/             # React + Material UI (consome a API FastAPI)
+├── notebooks/            # Análise exploratória de dados (EDA)
+│   ├── eda.py            # Script de EDA
+│   ├── eda.ipynb         # Notebook Jupyter equivalente
+│   └── eda_resumo.txt    # Saída textual da EDA
+├── recommender/          # Backend Python (FastAPI + recomendação)
+│   ├── pyproject.toml    # Dependências e config do pacote
+│   ├── src/              # Código-fonte (api, data, evaluation, models)
+│   ├── tests/            # Testes automatizados (pytest)
+│   ├── scripts/          # evaluate.py (avaliação offline)
+│   ├── results/          # evaluation_results.csv
+│   ├── RELATORIO_AVALIACAO.md   # Protocolo e resultados da avaliação
+│   └── uv.lock           # Lockfile do uv
+├── scripts/import_steam_db.py  # Importa dados brutos para o SQLite
+└── INSTRUCOES.md         # Requisitos e papéis do projeto
 ```
 
-## 1. Pré-requisitos
+## Começando rápido
 
-- Python >= 3.10
-- [uv](https://github.com/astral-sh/uv) (recomendado)
-- Node.js >= 18 (para o frontend React)
+### Pré-requisitos
 
-## 2. Instalação
+- Python 3.10+
+- [uv](https://github.com/astral-sh/uv) (recomendado) ou pip/virtualenv
 
-Crie o ambiente Python e instale as dependências:
+### 1. Importar os dados para o SQLite
+
+```bash
+python scripts/import_steam_db.py
+```
+
+Isso lê os arquivos de `data/raw/` e cria `data/steam.db` com as tabelas
+`games`, `users`, `recommendations` e `game_metadata`.
+
+### 2. Subir o backend (FastAPI)
 
 ```bash
 cd recommender
-uv venv
-uv sync
+uv run uvicorn src.api.main:app --reload --port 8000
 ```
 
-Instale as dependências do frontend React:
+O backend expõe:
+- `GET /health` — saúde da API
+- `GET /games` — catálogo paginado
+- `GET /tags` — tags disponíveis
+- `GET /users/search` — busca de usuários
+- `GET /users/{user_id}/recommendations` — recomendações para um usuário
+- `POST /recommendations/cold-start` — recomendações sem histórico
+
+### 3. Subir o frontend (React)
 
 ```bash
 cd frontend
-npm install
+npm install          # (ou yarn)
+npm run dev          # servidor de desenvolvimento em http://localhost:5173
 ```
 
-## 3. Dados
+O frontend está configurado para consumir `http://localhost:8000` por padrão
+(`DEFAULT_API_URL` em `frontend/src/services/api.js`).
 
-importação dos dados
-Faça o download do dataset em:
-https://www.kaggle.com/datasets/antonkozyriev/game-recommendations-on-steam
-Ponha os arquivos baixados em `data/raw`:
-`games.csv`
-`games_metadata.json`
-`recommendations.csv`
-`users.csv`
-e execute o script de importação dos dados (pode demorar alguns minutos):
+## Testes automatizados
 
-```bash
-python .\scripts\import_steam_db.py
-``` 
-Eles não são versionados (veja `.gitignore`).
-
-## 4. Execução
-
-### Preparar os dados (engenharia de dados)
+Os testes estão em `recommender/tests/` e rodam com `pytest`:
 
 ```bash
 cd recommender
-uv run python -m src.data.pipeline
+uv run pytest tests/
 ```
 
-### Rodar os testes automatizados
+## Avaliação offline
+
+Executa o protocolo treino/teste com Precision@N, Recall@N, nDCG@N, baselines
+e cobertura:
 
 ```bash
 cd recommender
-uv run pytest
+uv run python scripts/evaluate.py --users 100 --seed 42
 ```
 
-### Rodar o backend (FastAPI)
+Resultados em `recommender/results/evaluation_results.csv` e relatório em
+`recommender/RELATORIO_AVALIACAO.md`.
+
+## Análise exploratória (EDA)
+
+Executa estatísticas descritivas sobre jogos, usuários, recomendações e
+metadados:
 
 ```bash
-cd recommender
-uv run uvicorn src.api.main:app --reload
+python notebooks/eda.py
 ```
 
-### Rodar o frontend (React)
+Ou abra `notebooks/eda.ipynb` no Jupyter. A saída textual fica em
+`notebooks/eda_resumo.txt`.
 
-```bash
-cd frontend
-npm start
-```
-
-## 5. Requisitos do trabalho
-
-- Similaridade do cosseno obrigatória.
-- Não recomendar itens já consumidos pelo usuário.
-- Baselines: recomendação aleatória e itens mais populares.
-- Métricas: Precision@N, Recall@N, nDCG@N (N=5 e N=10), média sobre usuários.
-- Pelo menos uma métrica de cobertura/diversidade/novidade.
-- Semente aleatória fixa (reprodutibilidade).
-
-## 6. Status da implementação
-
-### ✅ Pronto
-
-- **Engenharia de dados** (`recommender/src/data/`): carregamento de arquivos brutos, limpeza de texto (stopwords EN/PT, stemming), construção de vetores de itens (TF-IDF + multi-hot tags + numéricos escalonados) e perfis de usuário (média ponderada por horas). Pipeline validado com dados reais.
-- **Modelo de recomendação** (`recommender/src/models/`): `ContentBasedRecommender` com similaridade do cosseno, Top-N e exclusão de itens já consumidos.
-- **Avaliação** (`recommender/src/evaluation/`): split treino/teste, Precision@N, Recall@N, nDCG@N, baselines (popularidade e aleatório), métrica de cobertura.
-- **Testes** (`recommender/tests/`): `test_recommender.py`, `test_evaluator.py`, `test_pipeline.py` (13/13 passando).
-- **README**: documentação da stack React + FastAPI e instruções de execução.
-
-### 🔲 TO DO
-
-- **Backend FastAPI** (`recommender/src/api/`): criar `src.api.main:app` com endpoints de recomendação consumindo `ContentBasedRecommender`.
-- **Frontend React** (`frontend/`): interface de demonstração que consome a API.
-- **Avaliação completa** com o dataset real (validação de Precision@N/Recall@N/nDCG@N em escala).
-
-## 7. Licença
+## Licença
 
 MIT — veja `LICENSE`.

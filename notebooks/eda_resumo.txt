@@ -1,0 +1,42 @@
+============================================================
+ANÁLISE EXPLORATÓRIA DE DADOS - DATASET STEAM
+============================================================
+
+1. Registros por tabela:
+   games: 50,872
+   users: 14,306,064
+   recommendations: 16,967,171
+   game_metadata: 50,872
+
+2. Estatísticas descritivas dos jogos (numéricos):
+   price_final: count=50872.0 | mean=8.620324933165591 | std=11.514164011296023 | min=0.0 | 25%=0.99 | 50%=4.99 | 75%=10.99 | max=299.99
+   discount: count=50872.0 | mean=5.592211825758767 | std=18.606679347266773 | min=0.0 | 25%=0.0 | 50%=0.0 | 75%=0.0 | max=90.0
+   positive_ratio: count=50872.0 | mean=77.0520325522881 | std=18.25359231279254 | min=0.0 | 25%=67.0 | 50%=81.0 | 75%=91.0 | max=100.0
+   user_reviews: count=50872.0 | mean=1824.4249882056927 | std=40073.52165326469 | min=10.0 | 25%=19.0 | 50%=49.0 | 75%=206.0 | max=7494460.0
+
+3. Qualidade dos metadados (game_metadata):
+   Total com metadados: 50,872
+   Com descrição preenchida: 40,499
+   Com tags preenchidas: 49,628
+
+4. Top 15 tags mais frequentes:
+   Indie: 27,957
+   Singleplayer: 22,566
+   Action: 21,897
+   Adventure: 20,183
+   Casual: 17,844
+   Simulation: 12,691
+   2D: 11,438
+   Strategy: 11,093
+   RPG: 10,156
+   Atmospheric: 8,688
+   Puzzle: 7,585
+   Story Rich: 7,149
+   Multiplayer: 6,575
+   3D: 6,142
+   Pixel Graphics: 6,028
+
+5. Sparsidade do histórico de recomendações:
+   Usuários com histórico: 8,247,765
+   Média de jogos por usuário: 2.06
+   Mediana de jogos por usuário: 1.0

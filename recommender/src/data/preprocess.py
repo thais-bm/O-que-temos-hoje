@@ -250,11 +250,12 @@ def build_item_vectors(
         desc_matrix = csr_matrix((len(df), 0))
         desc_features = []
 
-    desc_matrix = normalize(
-        desc_matrix,
-        norm="l2",
-        axis=1,
-    )
+    if desc_matrix.shape[1] > 0:
+        desc_matrix = normalize(
+            desc_matrix,
+            norm="l2",
+            axis=1,
+        )
 
     desc_weight = 1.0
     desc_matrix = desc_matrix * desc_weight
@@ -269,11 +270,12 @@ def build_item_vectors(
         tag_dummies.values.astype(float)
     )
 
-    tag_matrix = normalize(
-        tag_matrix,
-        norm="l2",
-        axis=1,
-    )
+    if tag_matrix.shape[1] > 0:
+        tag_matrix = normalize(
+            tag_matrix,
+            norm="l2",
+            axis=1,
+        )
 
     tag_features = [
         f"tag::{col}"
