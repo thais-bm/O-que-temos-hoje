@@ -8,6 +8,8 @@ dependencies = [
     "numpy>=1.26.0",
     "scikit-learn>=1.4.0",
     "nltk>=3.8.1",
+    "fastapi>=0.162.5",
+    "uvicorn[standard]>=0.54.0",
 ]
 
 [project.optional-dependencies]
