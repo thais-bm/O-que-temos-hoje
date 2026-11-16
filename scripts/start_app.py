@@ -1,5 +1,5 @@
-"""Script unificado para inicializar o banco SQLite (se necessário),
-o backend FastAPI e o frontend React (Vite) simultaneamente.
+"""Script unificado para preparar o ambiente virtual Python, o banco SQLite
+(se necessário), o backend FastAPI e o frontend React (Vite) simultaneamente.
 
 Execute a partir da raiz do repositório:
     python scripts/start_app.py
@@ -24,6 +24,7 @@ RAW_DIR = DATA_DIR / "raw"
 DB_PATH = DATA_DIR / "steam.db"
 IMPORT_SCRIPT = BASE_DIR / "scripts" / "import_steam_db.py"
 RECOMMENDER_DIR = BASE_DIR / "recommender"
+VENV_DIR = RECOMMENDER_DIR / ".venv"
 FRONTEND_DIR = BASE_DIR / "frontend"
 
 REQUIRED_RAW_FILES = (
@@ -69,7 +70,83 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
             pass
 
 
-def ensure_database(skip_db_check: bool = False) -> None:
+def get_venv_python() -> Path:
+    """Retorna o caminho do interpretador Python dentro de recommender/.venv."""
+    if os.name == "nt":
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python"
+
+
+def _venv_has_dependencies(python_bin: Path) -> bool:
+    """Verifica se o ambiente virtual existe e possui os pacotes principais."""
+    if not python_bin.exists():
+        return False
+
+    result = subprocess.run(
+        [
+            str(python_bin),
+            "-c",
+            "import fastapi, uvicorn, duckdb, sklearn, pandas, nltk",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def ensure_python_env() -> Path:
+    """Garante que recommender/.venv exista e esteja com as dependências instaladas."""
+    venv_python = get_venv_python()
+    if _venv_has_dependencies(venv_python):
+        print(f"[SETUP] Ambiente virtual Python pronto em: {VENV_DIR}")
+        return venv_python
+
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        print("[SETUP] Configurando ambiente virtual com 'uv sync' em recommender/...")
+        result = subprocess.run(
+            [uv_bin, "sync"],
+            cwd=str(RECOMMENDER_DIR),
+            check=False,
+        )
+        if result.returncode != 0:
+            print("[ERRO] Falha ao sincronizar dependências com 'uv sync'.", file=sys.stderr)
+            sys.exit(result.returncode)
+    else:
+        if not venv_python.exists():
+            print(f"[SETUP] Criando ambiente virtual em {VENV_DIR}...")
+            result = subprocess.run(
+                [sys.executable, "-m", "venv", str(VENV_DIR)],
+                cwd=str(BASE_DIR),
+                check=False,
+            )
+            if result.returncode != 0:
+                print("[ERRO] Falha ao criar o ambiente virtual Python.", file=sys.stderr)
+                sys.exit(result.returncode)
+
+        print("[SETUP] Instalando dependências Python em recommender/.venv via pip...")
+        result = subprocess.run(
+            [str(venv_python), "-m", "pip", "install", "-e", str(RECOMMENDER_DIR)],
+            cwd=str(BASE_DIR),
+            check=False,
+        )
+        if result.returncode != 0:
+            print("[ERRO] Falha ao instalar dependências Python via pip.", file=sys.stderr)
+            sys.exit(result.returncode)
+
+    if not _venv_has_dependencies(venv_python):
+        print(
+            "[ERRO] O ambiente virtual foi configurado, mas as dependências obrigatórias "
+            "não puderam ser importadas.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return venv_python
+
+
+def ensure_database(python_bin: Path, skip_db_check: bool = False) -> None:
     """Garante que data/steam.db exista antes de subir o backend."""
     if skip_db_check:
         return
@@ -91,7 +168,7 @@ def ensure_database(skip_db_check: bool = False) -> None:
     print("[SETUP] Executando importação inicial dos dados para o SQLite...")
     print("[SETUP] (Isso ocorre apenas na primeira execução e pode levar alguns minutos)")
     result = subprocess.run(
-        [sys.executable, str(IMPORT_SCRIPT)],
+        [str(python_bin), str(IMPORT_SCRIPT)],
         cwd=str(BASE_DIR),
         check=False,
     )
@@ -117,8 +194,12 @@ def ensure_frontend_deps(npm_cmd: str) -> None:
         sys.exit(result.returncode)
 
 
-def resolve_backend_cmd(port: int, reload_enabled: bool) -> list[str]:
-    """Determina o comando para iniciar o FastAPI (uv ou venv/python)."""
+def resolve_backend_cmd(
+    python_bin: Path,
+    port: int,
+    reload_enabled: bool,
+) -> list[str]:
+    """Determina o comando para iniciar o FastAPI usando o ambiente virtual."""
     uvicorn_args = [
         "src.api.main:app",
         "--host",
@@ -129,19 +210,7 @@ def resolve_backend_cmd(port: int, reload_enabled: bool) -> list[str]:
     if reload_enabled:
         uvicorn_args.append("--reload")
 
-    uv_bin = shutil.which("uv")
-    if uv_bin:
-        return [uv_bin, "run", "uvicorn", *uvicorn_args]
-
-    venv_python = (
-        RECOMMENDER_DIR / ".venv" / "Scripts" / "python.exe"
-        if os.name == "nt"
-        else RECOMMENDER_DIR / ".venv" / "bin" / "python"
-    )
-    if venv_python.exists():
-        return [str(venv_python), "-m", "uvicorn", *uvicorn_args]
-
-    return [sys.executable, "-m", "uvicorn", *uvicorn_args]
+    return [str(python_bin), "-m", "uvicorn", *uvicorn_args]
 
 
 def resolve_npm_cmd() -> str:
@@ -184,11 +253,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    ensure_database(skip_db_check=args.skip_db_check)
+    venv_python = ensure_python_env()
+    ensure_database(venv_python, skip_db_check=args.skip_db_check)
     npm_cmd = resolve_npm_cmd()
     ensure_frontend_deps(npm_cmd)
 
     backend_cmd = resolve_backend_cmd(
+        python_bin=venv_python,
         port=args.backend_port,
         reload_enabled=not args.no_reload,
     )
