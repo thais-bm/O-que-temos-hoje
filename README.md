@@ -236,6 +236,12 @@ O resumo textual é salvo em `notebooks/eda_resumo.txt`. Também é possível ab
 npm --prefix frontend run lint
 ```
 
+## Demonstração do Projeto
+
+[![Assista à demonstração](https://img.youtube.com/vi/Ukc89dVW9uk/maxresdefault.jpg)](https://youtu.be/Ukc89dVW9uk)
+
+Clique na imagem acima para assistir à demonstração do projeto no YouTube.
+
 ---
 
 ## Licença
