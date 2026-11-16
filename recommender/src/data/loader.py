@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -14,6 +16,46 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DB_PATH = PROJECT_ROOT / "data" / "steam.db"
+FRONTEND_DATASET_PATH = (
+    PROJECT_ROOT / "frontend" / "src" / "data" / "steamDataset.js"
+)
+
+
+@lru_cache(maxsize=1)
+def _get_curated_metadata() -> dict[int, dict[str, Any]]:
+    """Carrega metadados curados (descrição e tags) de jogos populares do repositório
+    para suprir registros que vieram vazios no arquivo bruto games_metadata.json.
+    """
+    if not FRONTEND_DATASET_PATH.exists():
+        return {}
+
+    try:
+        content = FRONTEND_DATASET_PATH.read_text(encoding="utf-8")
+        match = re.search(
+            r"export const STEAM_CATALOG = (\[.*?\n\])",
+            content,
+            re.DOTALL,
+        )
+        if not match:
+            return {}
+
+        items = json.loads(match.group(1))
+        curated: dict[int, dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict) or "app_id" not in item:
+                continue
+            app_id = int(item["app_id"])
+            curated[app_id] = {
+                "description": str(item.get("description") or "").strip(),
+                "tags": [
+                    str(t)
+                    for t in (item.get("tags") or [])
+                    if t is not None and str(t).strip()
+                ],
+            }
+        return curated
+    except Exception:
+        return {}
 
 
 @contextmanager
@@ -191,11 +233,22 @@ def load_games_page(
             [*params, limit, offset],
         ).fetchall()
 
+    curated = _get_curated_metadata()
     records = []
 
     for row in rows:
         record = dict(row)
-        record["tags"] = _parse_tags(record.get("tags"))
+        app_id = int(record["app_id"])
+        tags = _parse_tags(record.get("tags"))
+        description = record.get("description") or ""
+        fallback = curated.get(app_id)
+        if fallback:
+            if not description.strip() and fallback["description"]:
+                description = fallback["description"]
+            if not tags and fallback["tags"]:
+                tags = list(fallback["tags"])
+        record["description"] = description
+        record["tags"] = tags
         records.append(record)
 
     return records
@@ -267,14 +320,25 @@ def load_metadata(
             """
         ).fetchall()
 
+    curated = _get_curated_metadata()
     records = []
 
     for row in rows:
+        app_id = int(row["app_id"])
+        description = row["description"] or ""
+        tags = _parse_tags(row["tags"])
+        fallback = curated.get(app_id)
+        if fallback:
+            if not description.strip() and fallback["description"]:
+                description = fallback["description"]
+            if not tags and fallback["tags"]:
+                tags = list(fallback["tags"])
+
         records.append(
             {
-                "app_id": row["app_id"],
-                "description": row["description"] or "",
-                "tags": _parse_tags(row["tags"]),
+                "app_id": app_id,
+                "description": description,
+                "tags": tags,
             }
         )
 

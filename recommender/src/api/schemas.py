@@ -22,6 +22,7 @@ class ProfileFeature(BaseModel):
 
 class HistoryInteraction(BaseModel):
     app_id: int
+    title: str | None = None
     hours: float
     is_recommended: bool
     weight: float

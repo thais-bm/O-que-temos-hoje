@@ -1,9 +1,16 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import { Box, Typography } from '@mui/material'
 import { getSteamHeaderImage } from '../utils/fbcEngine'
 
-export function GameCover({ appId, title, width = '100%', height = '100%', borderRadius = 1 }) {
-  const [failed, setFailed] = useState(false)
+export const GameCover = memo(function GameCover({
+  appId,
+  title,
+  width = '100%',
+  height = '100%',
+  borderRadius = 1,
+}) {
+  const [failedAppId, setFailedAppId] = useState(null)
+  const failed = failedAppId === appId
 
   if (failed || !appId) {
     return (
@@ -41,7 +48,8 @@ export function GameCover({ appId, title, width = '100%', height = '100%', borde
       src={getSteamHeaderImage(appId)}
       alt={title}
       loading="lazy"
-      onError={() => setFailed(true)}
+      decoding="async"
+      onError={() => setFailedAppId(appId)}
       sx={{
         width,
         height,
@@ -52,4 +60,4 @@ export function GameCover({ appId, title, width = '100%', height = '100%', borde
       }}
     />
   )
-}
+})

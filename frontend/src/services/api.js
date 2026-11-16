@@ -11,20 +11,48 @@ export const DEFAULT_API_URL = (
 ).replace(/\/+$/, '')
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const { signal: externalSignal, ...restOptions } = options
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  let timedOut = false
+
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
+
+  const onExternalAbort = () => controller.abort()
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      clearTimeout(timer)
+      controller.abort()
+    } else {
+      externalSignal.addEventListener('abort', onExternalAbort, { once: true })
+    }
+  }
 
   try {
     return await fetch(url, {
-      ...options,
+      ...restOptions,
       signal: controller.signal,
       headers: {
-        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-        ...(options.headers || {}),
+        ...(restOptions.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(restOptions.headers || {}),
       },
     })
+  } catch (error) {
+    if (error.name === 'AbortError' && !timedOut) {
+      const cancelError = new Error('Requisição cancelada.', { cause: error })
+      cancelError.name = 'AbortError'
+      cancelError.isCancelled = true
+      throw cancelError
+    }
+    throw error
   } finally {
     clearTimeout(timer)
+    if (externalSignal) {
+      externalSignal.removeEventListener('abort', onExternalAbort)
+    }
   }
 }
 
@@ -34,12 +62,19 @@ async function requestJson(url, options = {}, timeoutMs = 10000) {
   try {
     response = await fetchWithTimeout(url, options, timeoutMs)
   } catch (error) {
+    if (error.isCancelled) {
+      throw error
+    }
+
     if (error.name === 'AbortError') {
-      throw new Error('O backend demorou demais para responder.')
+      throw new Error('O backend demorou demais para responder.', {
+        cause: error,
+      })
     }
 
     throw new Error(
-      `Não foi possível conectar ao backend: ${error.message}`
+      `Não foi possível conectar ao backend: ${error.message}`,
+      { cause: error }
     )
   }
 
@@ -102,6 +137,7 @@ export async function fetchGamesApi({
   limit = 24,
   offset = 0,
   baseUrl = DEFAULT_API_URL,
+  signal,
 } = {}) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
     throw new Error('O limite do catálogo deve estar entre 1 e 100.')
@@ -121,7 +157,7 @@ export async function fetchGamesApi({
 
   const payload = await requestJson(
     `${baseUrl.replace(/\/+$/, '')}/games?${params}`,
-    { method: 'GET' },
+    { method: 'GET', signal },
     15000
   )
 
@@ -219,6 +255,7 @@ export async function fetchUserRecommendationsApi(
     topN = 10,
     excludeConsumed = true,
     baseUrl = DEFAULT_API_URL,
+    signal,
   } = {}
 ) {
   if (
@@ -240,7 +277,7 @@ export async function fetchUserRecommendationsApi(
 
   const payload = await requestJson(
     `${baseUrl.replace(/\/+$/, '')}/users/${encodeURIComponent(userId)}/recommendations?${params}`,
-    { method: 'GET' },
+    { method: 'GET', signal },
     30000
   )
 
@@ -268,6 +305,7 @@ export async function fetchColdStartRecommendationsApi(
     tags = [],
     topN = 10,
     baseUrl = DEFAULT_API_URL,
+    signal,
   } = {}
 ) {
   if (!Array.isArray(appIds) || !Array.isArray(tags)) {
@@ -294,6 +332,7 @@ export async function fetchColdStartRecommendationsApi(
     `${baseUrl.replace(/\/+$/, '')}/recommendations/cold-start`,
     {
       method: 'POST',
+      signal,
       body: JSON.stringify({
         app_ids: appIds.map(Number),
         tags,

@@ -1,5 +1,4 @@
-
-import { useState, useMemo, useEffect, useCallback } from 'react'
+import { useState, useMemo, useEffect, useCallback, useRef, memo } from 'react'
 import {
   ThemeProvider,
   CssBaseline,
@@ -34,6 +33,7 @@ import {
   SvgIcon,
   Avatar,
   CircularProgress,
+  Autocomplete,
 } from '@mui/material'
 
 import { steamDarkTheme } from './theme'
@@ -122,6 +122,9 @@ const POPULAR_GENRES = [
 
 const INITIAL_USER_ID = 11764552
 const CATALOG_PAGE_SIZE = 24
+const HISTORY_INITIAL_LIMIT = 12
+
+const EXISTING_PRESET_IDS = REAL_STEAM_USERS.map((user) => Number(user.user_id))
 
 function formatNumber(value, decimals = 0) {
   const number = Number(value)
@@ -131,6 +134,17 @@ function formatNumber(value, decimals = 0) {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   })
+}
+
+/**
+ * O perfil é uma média de vetores de tags normalizados (L2), então o peso bruto
+ * de cada tag é pequeno (~0.05–0.2) em bibliotecas grandes. Para exibição,
+ * a intensidade é relativa à tag mais forte do perfil (a maior = 100%).
+ */
+function tagRelativePct(weight, tags) {
+  const max = Math.max(...tags.map((t) => t.weight), 0)
+  if (!max) return 0
+  return Math.round(Math.min(100, (weight / max) * 100))
 }
 
 function formatPrice(value) {
@@ -233,16 +247,749 @@ function normalizeProfile(profile = {}) {
       label: feature.label,
       weight: Number(feature.weight) || 0,
     })),
-    historyWithWeight: (profile.history_with_weight || []).map((item) => ({
-      app_id: Number(item.app_id),
-      hours: Number(item.hours) || 0,
-      is_recommended: Boolean(item.is_recommended),
-      weight: Number(item.weight) || 0,
-      weight_share_pct: Number(item.weight_share_pct) || 0,
-      game: null,
-    })),
+    historyWithWeight: (profile.history_with_weight || []).map((item) => {
+      const appId = Number(item.app_id)
+      const title = item.title || item.game?.title || null
+
+      return {
+        app_id: appId,
+        title,
+        hours: Number(item.hours) || 0,
+        is_recommended: Boolean(item.is_recommended),
+        weight: Number(item.weight) || 0,
+        weight_share_pct: Number(item.weight_share_pct) || 0,
+        game: title ? { app_id: appId, title } : null,
+      }
+    }),
   }
 }
+
+/**
+ * Formulário isolado para busca por Steam ID.
+ * Mantém o estado de digitação localmente para não re-renderizar a página inteira a cada tecla.
+ */
+const SteamIdLookupForm = memo(function SteamIdLookupForm({ onLookup, loading }) {
+  const [input, setInput] = useState('')
+
+  function handleSubmit(event) {
+    event.preventDefault()
+    const trimmed = input.trim()
+    if (!trimmed) return
+    onLookup(trimmed, () => setInput(''))
+  }
+
+  return (
+    <Box
+      component="form"
+      onSubmit={handleSubmit}
+      sx={{ display: 'flex', gap: 1 }}
+    >
+      <TextField
+        fullWidth
+        size="small"
+        placeholder="Buscar por Steam ID..."
+        value={input}
+        onChange={(event) => setInput(event.target.value)}
+      />
+
+      <Button
+        type="submit"
+        variant="outlined"
+        size="small"
+        disabled={loading}
+      >
+        {loading ? <CircularProgress size={18} /> : 'Carregar'}
+      </Button>
+    </Box>
+  )
+})
+
+/**
+ * Seletor com busca para adicionar jogo de referência no modo Novo Usuário.
+ * Exibe inicialmente os jogos já carregados no catálogo e busca na API ao digitar.
+ */
+const ReferenceGamePicker = memo(function ReferenceGamePicker({
+  availableGames,
+  selectedIds,
+  apiUrl,
+  onAddGame,
+}) {
+  const [selectedGame, setSelectedGame] = useState(null)
+  const [inputValue, setInputValue] = useState('')
+  const [searchOptions, setSearchOptions] = useState([])
+  const [searching, setSearching] = useState(false)
+
+  const trimmedQuery = inputValue.trim()
+  const matchesSelectedTitle =
+    Boolean(selectedGame) &&
+    trimmedQuery === (selectedGame.title || '').trim()
+
+  useEffect(() => {
+    if (!trimmedQuery || matchesSelectedTitle) {
+      return undefined
+    }
+
+    const controller = new AbortController()
+    const timerId = setTimeout(() => {
+      fetchGamesApi({
+        search: trimmedQuery,
+        limit: 24,
+        offset: 0,
+        baseUrl: apiUrl,
+        signal: controller.signal,
+      })
+        .then((data) => {
+          setSearchOptions(data.games || [])
+        })
+        .catch((err) => {
+          if (!err?.isCancelled && err?.name !== 'AbortError') {
+            setSearchOptions([])
+          }
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) {
+            setSearching(false)
+          }
+        })
+    }, 250)
+
+    return () => {
+      clearTimeout(timerId)
+      controller.abort()
+    }
+  }, [trimmedQuery, matchesSelectedTitle, apiUrl])
+
+  const options = useMemo(() => {
+    const source =
+      trimmedQuery && !matchesSelectedTitle ? searchOptions : availableGames
+    const filtered = source.filter(
+      (game) => !selectedIds.has(Number(game.app_id))
+    )
+    if (
+      selectedGame &&
+      !selectedIds.has(Number(selectedGame.app_id)) &&
+      !filtered.some((g) => Number(g.app_id) === Number(selectedGame.app_id))
+    ) {
+      return [selectedGame, ...filtered]
+    }
+    return filtered
+  }, [
+    trimmedQuery,
+    matchesSelectedTitle,
+    searchOptions,
+    availableGames,
+    selectedIds,
+    selectedGame,
+  ])
+
+  function handleAdd() {
+    if (!selectedGame) return
+    onAddGame(selectedGame.app_id, selectedGame)
+    setSelectedGame(null)
+    setInputValue('')
+    setSearchOptions([])
+    setSearching(false)
+  }
+
+  return (
+    <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+      <Autocomplete
+        fullWidth
+        size="small"
+        openOnFocus
+        options={options}
+        value={selectedGame}
+        inputValue={inputValue}
+        loading={searching}
+        filterOptions={(opts) => opts}
+        getOptionLabel={(option) => option?.title || ''}
+        isOptionEqualToValue={(option, value) =>
+          Number(option?.app_id) === Number(value?.app_id)
+        }
+        noOptionsText={
+          trimmedQuery
+            ? 'Nenhum jogo encontrado para essa busca.'
+            : 'Nenhum jogo disponível.'
+        }
+        loadingText="Buscando jogos..."
+        onChange={(_, newValue) => {
+          setSelectedGame(newValue)
+          setSearching(false)
+        }}
+        onInputChange={(_, newInputValue, reason) => {
+          setInputValue(newInputValue)
+          if (reason === 'reset') {
+            setSearching(false)
+            if (!newInputValue) {
+              setSearchOptions([])
+            }
+            return
+          }
+          if (reason === 'input' && selectedGame) {
+            setSelectedGame(null)
+          }
+          const nextTrimmed = newInputValue.trim()
+          if (!nextTrimmed) {
+            setSearchOptions([])
+            setSearching(false)
+          } else if (nextTrimmed !== trimmedQuery) {
+            setSearching(true)
+          }
+        }}
+        slotProps={{
+          listbox: { style: { maxHeight: 340 } },
+        }}
+        renderOption={(props, option) => {
+          const { key, ...optionProps } = props
+          const tagPreview = (option.tags || []).slice(0, 3).join(', ')
+          return (
+            <Box
+              component="li"
+              key={key ?? option.app_id}
+              {...optionProps}
+              sx={{
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'flex-start !important',
+                py: 0.75,
+              }}
+            >
+              <Typography variant="body2" fontWeight={600}>
+                {option.title}
+              </Typography>
+              {tagPreview && (
+                <Typography variant="caption" color="text.secondary">
+                  {tagPreview}
+                </Typography>
+              )}
+            </Box>
+          )
+        }}
+        renderInput={(params) => (
+          <TextField
+            {...params}
+            label="Buscar ou selecionar um título de referência..."
+            placeholder="Digite o nome de um jogo ou escolha na lista"
+            slotProps={{
+              ...params.slotProps,
+              input: {
+                ...params.slotProps?.input,
+                endAdornment: (
+                  <>
+                    {searching ? (
+                      <CircularProgress color="inherit" size={16} />
+                    ) : null}
+                    {params.slotProps?.input?.endAdornment}
+                  </>
+                ),
+              },
+            }}
+          />
+        )}
+      />
+
+      <Button
+        variant="contained"
+        color="primary"
+        size="small"
+        startIcon={<AddIcon />}
+        disabled={!selectedGame}
+        onClick={handleAdd}
+        sx={{
+          px: 2,
+          py: 0.9,
+          whiteSpace: 'nowrap',
+          flexShrink: 0,
+        }}
+      >
+        Marcar interesse
+      </Button>
+    </Box>
+  )
+})
+
+/**
+ * Lista paginada da biblioteca recente do usuário para evitar montar centenas de cards/imagens de uma vez.
+ */
+const UserHistoryList = memo(function UserHistoryList({ history }) {
+  const [showAll, setShowAll] = useState(false)
+
+  const visibleHistory = useMemo(
+    () => (showAll ? history : history.slice(0, HISTORY_INITIAL_LIMIT)),
+    [history, showAll]
+  )
+
+  const hiddenCount = history.length - visibleHistory.length
+
+  if (history.length === 0) {
+    return (
+      <Typography variant="body2" color="text.secondary">
+        Nenhum histórico disponível para este usuário.
+      </Typography>
+    )
+  }
+
+  return (
+    <Stack spacing={1.25}>
+      {visibleHistory.map((item) => (
+        <Paper
+          key={item.app_id}
+          sx={{
+            p: 1.25,
+            bgcolor: '#121a24',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 1.5,
+          }}
+        >
+          <Box
+            sx={{
+              width: 84,
+              height: 40,
+              flexShrink: 0,
+            }}
+          >
+            <GameCover
+              appId={item.app_id}
+              title={item.game?.title || ''}
+            />
+          </Box>
+
+          <Box sx={{ flex: 1, minWidth: 0 }}>
+            <Typography
+              variant="body2"
+              sx={{ fontWeight: 600 }}
+              noWrap
+            >
+              {item.game?.title || `App #${item.app_id}`}
+            </Typography>
+
+            <Stack
+              direction="row"
+              spacing={1}
+              sx={{ alignItems: 'center', mt: 0.25 }}
+            >
+              <Typography
+                variant="caption"
+                color="text.secondary"
+              >
+                {formatNumber(item.hours, 1)}h jogadas
+              </Typography>
+
+              <Chip
+                label={
+                  item.is_recommended
+                    ? 'Recomendou'
+                    : 'Não recomendou'
+                }
+                size="small"
+                color={
+                  item.is_recommended ? 'default' : 'error'
+                }
+                variant="outlined"
+                sx={{
+                  height: 18,
+                  fontSize: '0.66rem',
+                }}
+              />
+            </Stack>
+          </Box>
+        </Paper>
+      ))}
+
+      {history.length > HISTORY_INITIAL_LIMIT && (
+        <Button
+          size="small"
+          variant="text"
+          onClick={() => setShowAll((prev) => !prev)}
+          sx={{ alignSelf: 'center', mt: 0.5 }}
+        >
+          {showAll
+            ? 'Mostrar menos'
+            : `Ver mais ${formatNumber(hiddenCount)} jogos da biblioteca`}
+        </Button>
+      )}
+    </Stack>
+  )
+})
+
+/**
+ * Card memoizado de recomendação individual.
+ */
+const RecommendationCard = memo(function RecommendationCard({
+  rec,
+  userType,
+  onInspect,
+}) {
+  const game = rec.game
+  const explanation = rec.explanation
+
+  return (
+    <Card sx={{ overflow: 'hidden' }}>
+      <Grid container>
+        <Grid size={{ xs: 12, sm: 4, md: 3.6 }}>
+          <Box
+            sx={{
+              height: { xs: 165, sm: '100%' },
+              minHeight: 145,
+            }}
+          >
+            <GameCover
+              appId={rec.app_id}
+              title={game.title}
+              borderRadius={0}
+            />
+          </Box>
+        </Grid>
+
+        <Grid size={{ xs: 12, sm: 8, md: 8.4 }}>
+          <Box sx={{ p: 2.5 }}>
+            <Stack
+              direction="row"
+              spacing={1.5}
+              sx={{
+                justifyContent: 'space-between',
+                alignItems: 'flex-start',
+              }}
+            >
+              <Box sx={{ minWidth: 0 }}>
+                <Typography
+                  variant="h6"
+                  sx={{
+                    fontSize: '1.05rem',
+                    fontWeight: 700,
+                  }}
+                >
+                  {game.title}
+                </Typography>
+
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                >
+                  Avaliações: {game.rating || 'N/D'} (
+                  {game.positive_ratio ?? 'N/D'}%) ·
+                  Lançamento: {game.date_release || 'N/D'} ·{' '}
+                  {formatPrice(game.price_final)}
+                </Typography>
+              </Box>
+
+              <Chip
+                label={`${(rec.similarity * 100).toFixed(0)}% compatível`}
+                color="secondary"
+                size="small"
+                sx={{
+                  fontWeight: 700,
+                  flexShrink: 0,
+                }}
+              />
+            </Stack>
+
+            <Typography
+              variant="body2"
+              color="text.secondary"
+              sx={{
+                mt: 1,
+                mb: 1.75,
+                display: '-webkit-box',
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: 'vertical',
+                overflow: 'hidden',
+              }}
+            >
+              {game.description || 'Descrição indisponível.'}
+            </Typography>
+
+            <Paper
+              sx={{
+                p: 1.5,
+                bgcolor: '#111923',
+                borderColor: 'rgba(102, 192, 244, 0.14)',
+              }}
+            >
+              <Box
+                sx={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: 1,
+                  mb: 1,
+                }}
+              >
+                {userType === 'existing' &&
+                explanation.mostSimilarConsumed ? (
+                  <Typography
+                    variant="caption"
+                    color="text.primary"
+                  >
+                    Recomendado porque você jogou{' '}
+                    <Box
+                      component="span"
+                      sx={{
+                        color: 'primary.main',
+                        fontWeight: 600,
+                      }}
+                    >
+                      {explanation.mostSimilarConsumed.title}
+                    </Box>{' '}
+                    ({formatNumber(
+                      explanation.mostSimilarConsumed.hours,
+                      1
+                    )}h)
+                  </Typography>
+                ) : (
+                  <Typography
+                    variant="caption"
+                    color="text.primary"
+                  >
+                    {userType === 'new'
+                      ? 'Combina com suas preferências iniciais:'
+                      : 'Compatível com seu perfil de jogador:'}
+                  </Typography>
+                )}
+
+                <Button
+                  size="small"
+                  variant="text"
+                  startIcon={<InfoOutlinedIcon fontSize="small" />}
+                  onClick={() => onInspect(rec)}
+                  sx={{
+                    py: 0,
+                    fontSize: '0.74rem',
+                  }}
+                >
+                  Por que combina comigo?
+                </Button>
+              </Box>
+
+              <Box
+                sx={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: 0.75,
+                }}
+              >
+                {explanation.matchedTags.slice(0, 5).map((tag) => (
+                  <Chip
+                    key={tag.tag}
+                    label={tag.tag}
+                    size="small"
+                    color="primary"
+                    variant="outlined"
+                    sx={{
+                      height: 22,
+                      fontSize: '0.72rem',
+                    }}
+                  />
+                ))}
+              </Box>
+            </Paper>
+          </Box>
+        </Grid>
+      </Grid>
+    </Card>
+  )
+})
+
+/**
+ * Barra de busca e filtro do catálogo com estado de digitação isolado e lista de tags memoizada.
+ */
+const CatalogFilterBar = memo(function CatalogFilterBar({
+  initialSearch,
+  onSearchChange,
+  tagFilter,
+  onTagFilterChange,
+  allCatalogTags,
+  catalogLoading,
+  catalogTotal,
+}) {
+  const [localSearch, setLocalSearch] = useState(initialSearch)
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      onSearchChange(localSearch)
+    }, 250)
+    return () => clearTimeout(timer)
+  }, [localSearch, onSearchChange])
+
+  const tagMenuItems = useMemo(
+    () =>
+      allCatalogTags.map((tag) => (
+        <MenuItem key={tag} value={tag}>
+          {tag}
+        </MenuItem>
+      )),
+    [allCatalogTags]
+  )
+
+  return (
+    <Paper sx={{ p: 2.5 }}>
+      <Grid container spacing={2} sx={{ alignItems: 'center' }}>
+        <Grid size={{ xs: 12, md: 6 }}>
+          <TextField
+            fullWidth
+            size="small"
+            label="Buscar jogo pelo nome ou tema"
+            value={localSearch}
+            onChange={(event) => setLocalSearch(event.target.value)}
+          />
+        </Grid>
+
+        <Grid size={{ xs: 12, sm: 6, md: 4 }}>
+          <FormControl fullWidth size="small">
+            <InputLabel id="tag-filter-label">
+              Filtrar por Gênero / Tag
+            </InputLabel>
+
+            <Select
+              labelId="tag-filter-label"
+              label="Filtrar por Gênero / Tag"
+              value={tagFilter}
+              onChange={(event) => onTagFilterChange(event.target.value)}
+              MenuProps={{ PaperProps: { sx: { maxHeight: 360 } } }}
+            >
+              <MenuItem value="ALL">
+                Todos os Gêneros ({allCatalogTags.length})
+              </MenuItem>
+
+              {tagMenuItems}
+            </Select>
+          </FormControl>
+        </Grid>
+
+        <Grid size={{ xs: 12, sm: 6, md: 2 }}>
+          <Typography variant="caption" color="text.secondary">
+            {catalogLoading
+              ? 'Buscando...'
+              : `${formatNumber(catalogTotal)} jogos encontrados`}
+          </Typography>
+        </Grid>
+      </Grid>
+    </Paper>
+  )
+})
+
+/**
+ * Card memoizado de item do catálogo.
+ */
+const CatalogGameCard = memo(function CatalogGameCard({
+  game,
+  alreadySelected,
+  limitReached,
+  onSelectGame,
+}) {
+  return (
+    <Grid size={{ xs: 12, sm: 6, md: 4, lg: 3 }}>
+      <Card
+        sx={{
+          height: '100%',
+          display: 'flex',
+          flexDirection: 'column',
+          justifyContent: 'space-between',
+        }}
+      >
+        <Box>
+          <Box sx={{ height: 135 }}>
+            <GameCover
+              appId={game.app_id}
+              title={game.title}
+              borderRadius={0}
+            />
+          </Box>
+
+          <Box sx={{ p: 2 }}>
+            <Stack
+              direction="row"
+              spacing={1}
+              sx={{
+                justifyContent: 'space-between',
+                alignItems: 'flex-start',
+              }}
+            >
+              <Typography
+                variant="subtitle1"
+                sx={{ fontSize: '0.95rem' }}
+              >
+                {game.title}
+              </Typography>
+
+              <Typography
+                variant="caption"
+                sx={{
+                  fontFamily: 'monospace',
+                  color: 'secondary.main',
+                  fontWeight: 600,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {game.price_final === 0
+                  ? 'Gratuito'
+                  : formatPrice(game.price_final)}
+              </Typography>
+            </Stack>
+
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ display: 'block', mb: 1 }}
+            >
+              {game.rating || 'N/D'} ({game.positive_ratio ?? 'N/D'}%)
+            </Typography>
+
+            <Typography
+              variant="body2"
+              color="text.secondary"
+              sx={{
+                mb: 1.5,
+                display: '-webkit-box',
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: 'vertical',
+                overflow: 'hidden',
+              }}
+            >
+              {game.description || 'Descrição indisponível.'}
+            </Typography>
+
+            <Box
+              sx={{
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: 0.5,
+              }}
+            >
+              {(game.tags || []).slice(0, 4).map((tag) => (
+                <Chip
+                  key={tag}
+                  label={tag}
+                  size="small"
+                  sx={{
+                    height: 20,
+                    fontSize: '0.68rem',
+                  }}
+                />
+              ))}
+            </Box>
+          </Box>
+        </Box>
+
+        <Box sx={{ px: 2, pb: 2 }}>
+          <Button
+            fullWidth
+            size="small"
+            variant={alreadySelected ? 'contained' : 'outlined'}
+            disabled={alreadySelected || limitReached}
+            onClick={() => onSelectGame(game)}
+          >
+            {alreadySelected
+              ? 'Marcado como interesse'
+              : 'Tenho interesse neste jogo'}
+          </Button>
+        </Box>
+      </Card>
+    </Grid>
+  )
+})
 
 function App() {
   const [userType, setUserType] = useState('existing')
@@ -250,14 +997,13 @@ function App() {
 
   // Usuário existente: o ID inicial já foi validado no backend.
   const [selectedUserId, setSelectedUserId] = useState(INITIAL_USER_ID)
-  const [customUidInput, setCustomUidInput] = useState('')
   const [userMetadata, setUserMetadata] = useState(null)
   const [lookupLoading, setLookupLoading] = useState(false)
 
   // Preferências de cold-start.
   const [newUserTags, setNewUserTags] = useState([])
   const [newUserRefGames, setNewUserRefGames] = useState([])
-  const [selectedAddGameId, setSelectedAddGameId] = useState('')
+  const [knownGamesById, setKnownGamesById] = useState(() => new Map())
 
   // Quantidade de recomendações.
   const [topN, setTopN] = useState(10)
@@ -288,7 +1034,6 @@ function App() {
   })
   const [recommendationLoading, setRecommendationLoading] = useState(false)
   const [recommendationError, setRecommendationError] = useState('')
-  const [recommendationSource, setRecommendationSource] = useState('')
 
   // Estado geral da API.
   const apiUrl = DEFAULT_API_URL
@@ -296,6 +1041,9 @@ function App() {
 
   // Dialog de explicação.
   const [inspectedRec, setInspectedRec] = useState(null)
+
+  // Evita requisição duplicada ao buscar um Steam ID manualmente.
+  const prefetchedUserRecRef = useRef(null)
 
   const selectedExistingUser = useMemo(() => {
     return (
@@ -313,9 +1061,9 @@ function App() {
   const newUserHasAnyPreference =
     newUserTags.length > 0 || newUserRefGames.length > 0
 
-  const catalogGamesById = useMemo(
-    () => new Map(catalogGames.map((game) => [Number(game.app_id), game])),
-    [catalogGames]
+  const newUserRefIdSet = useMemo(
+    () => new Set(newUserRefGames.map((item) => Number(item.app_id))),
+    [newUserRefGames]
   )
 
   const availablePopularTags = useMemo(() => {
@@ -331,12 +1079,10 @@ function App() {
   }, [allCatalogTags])
 
   const availableGamesToPick = useMemo(() => {
-    const picked = new Set(newUserRefGames.map((item) => Number(item.app_id)))
-
     return catalogGames.filter(
-      (game) => !picked.has(Number(game.app_id))
+      (game) => !newUserRefIdSet.has(Number(game.app_id))
     )
-  }, [catalogGames, newUserRefGames])
+  }, [catalogGames, newUserRefIdSet])
 
   // Verifica a API e carrega as tags reais do catálogo.
   useEffect(() => {
@@ -346,7 +1092,7 @@ function App() {
       if (active) setApiOnline(result.online)
     })
 
-    fetchTagsApi()
+    fetchTagsApi(apiUrl)
       .then((tags) => {
         if (active) setAllCatalogTags(tags)
       })
@@ -359,12 +1105,17 @@ function App() {
     }
   }, [apiUrl])
 
-  // Carrega a primeira página do catálogo.
-  // O pequeno atraso evita várias consultas durante a digitação.
-  useEffect(() => {
-    let active = true
+  // Carrega a primeira página do catálogo apenas quando necessária
+  // (aba Explorar Catálogo ou modo Novo Usuário para seleção de jogos de referência).
+  const needsCatalog = pageView === 'catalog' || userType === 'new'
 
-    const timer = setTimeout(async () => {
+  useEffect(() => {
+    if (!needsCatalog) return
+
+    let active = true
+    const controller = new AbortController()
+
+    async function loadCatalogFirstPage() {
       setCatalogLoading(true)
       setCatalogError('')
       setCatalogOffset(0)
@@ -376,17 +1127,23 @@ function App() {
           limit: CATALOG_PAGE_SIZE,
           offset: 0,
           baseUrl: apiUrl,
+          signal: controller.signal,
         })
 
         if (!active) return
 
         setCatalogGames(result.games)
+        setKnownGamesById((prev) => {
+          const next = new Map(prev)
+          result.games.forEach((g) => next.set(Number(g.app_id), g))
+          return next
+        })
         setCatalogTotal(result.total)
         setCatalogHasMore(result.hasMore)
         setCatalogOffset(result.games.length)
         setApiOnline(true)
       } catch (error) {
-        if (!active) return
+        if (!active || error.isCancelled) return
 
         setCatalogGames([])
         setCatalogTotal(0)
@@ -395,13 +1152,15 @@ function App() {
       } finally {
         if (active) setCatalogLoading(false)
       }
-    }, 250)
+    }
+
+    loadCatalogFirstPage()
 
     return () => {
       active = false
-      clearTimeout(timer)
+      controller.abort()
     }
-  }, [catalogSearch, catalogTagFilter, apiUrl])
+  }, [needsCatalog, catalogSearch, catalogTagFilter, apiUrl])
 
   // Carrega mais jogos usando a paginação do backend.
   const handleLoadMoreCatalog = useCallback(async () => {
@@ -428,11 +1187,19 @@ function App() {
         return [...previous, ...newGames]
       })
 
+      setKnownGamesById((prev) => {
+        const next = new Map(prev)
+        result.games.forEach((g) => next.set(Number(g.app_id), g))
+        return next
+      })
+
       setCatalogOffset((previous) => previous + result.games.length)
       setCatalogHasMore(result.hasMore)
       setApiOnline(true)
     } catch (error) {
-      setCatalogError(error.message)
+      if (!error.isCancelled) {
+        setCatalogError(error.message)
+      }
     } finally {
       setCatalogLoadingMore(false)
     }
@@ -448,27 +1215,45 @@ function App() {
   // Busca recomendações reais sempre que o perfil ou top N mudar.
   useEffect(() => {
     let active = true
+    const controller = new AbortController()
+    const delayMs = userType === 'new' && newUserHasAnyPreference ? 180 : 0
 
     async function loadRecommendations() {
-      setRecommendationError('')
-      setRecommendations([])
-      setProfileSummary({
-        totalHours: 0,
-        validGames: 0,
-        validInteractions: 0,
-        positiveInteractions: 0,
-        negativeInteractions: 0,
-        topTags: [],
-        topTerms: [],
-        historyWithWeight: [],
-      })
-
       if (userType === 'new' && !newUserHasAnyPreference) {
         setRecommendationLoading(false)
-        setRecommendationSource('')
+        setRecommendationError('')
+        setRecommendations([])
+        setProfileSummary({
+          totalHours: 0,
+          validGames: 0,
+          validInteractions: 0,
+          positiveInteractions: 0,
+          negativeInteractions: 0,
+          topTags: [],
+          topTerms: [],
+          historyWithWeight: [],
+        })
         return
       }
 
+      // Reaproveita resultado já buscado pelo lookup manual de Steam ID para evitar chamada dupla.
+      if (
+        userType === 'existing' &&
+        prefetchedUserRecRef.current &&
+        prefetchedUserRecRef.current.userId === Number(selectedUserId) &&
+        prefetchedUserRecRef.current.topN === topN
+      ) {
+        const cached = prefetchedUserRecRef.current.result
+        prefetchedUserRecRef.current = null
+        setRecommendationError('')
+        setRecommendationLoading(false)
+        setProfileSummary(normalizeProfile(cached.payload.profile))
+        setRecommendations((cached.rawList || []).map(normalizeRecommendation))
+        setApiOnline(true)
+        return
+      }
+
+      setRecommendationError('')
       setRecommendationLoading(true)
 
       try {
@@ -479,19 +1264,20 @@ function App() {
             topN,
             excludeConsumed: true,
             baseUrl: apiUrl,
+            signal: controller.signal,
           })
 
           if (!active) return
 
           const payload = result.payload
           setProfileSummary(normalizeProfile(payload.profile))
-          setRecommendationSource('historical')
         } else {
           result = await fetchColdStartRecommendationsApi({
             appIds: newUserRefGames.map((item) => Number(item.app_id)),
             tags: newUserTags,
             topN,
             baseUrl: apiUrl,
+            signal: controller.signal,
           })
 
           if (!active) return
@@ -514,8 +1300,6 @@ function App() {
             })),
             historyWithWeight: [],
           })
-
-          setRecommendationSource('cold-start')
         }
 
         if (!active) return
@@ -525,19 +1309,21 @@ function App() {
         )
         setApiOnline(true)
       } catch (error) {
-        if (!active) return
+        if (!active || error.isCancelled) return
 
+        setRecommendations([])
         setRecommendationError(error.message)
-        setRecommendationSource('')
       } finally {
         if (active) setRecommendationLoading(false)
       }
     }
 
-    loadRecommendations()
+    const timer = setTimeout(loadRecommendations, delayMs)
 
     return () => {
       active = false
+      clearTimeout(timer)
+      controller.abort()
     }
   }, [
     userType,
@@ -549,95 +1335,123 @@ function App() {
     apiUrl,
   ])
 
-  async function handleLookupSteamId(event) {
-    event.preventDefault()
+  const handleLookupSteamId = useCallback(
+    async (trimmedInput, onSuccessClear) => {
+      const uid = Number(trimmedInput)
 
-    const trimmed = customUidInput.trim()
-    if (!trimmed) return
-
-    const uid = Number(trimmed)
-
-    if (!Number.isSafeInteger(uid) || uid < 0) {
-      setRecommendationError('Informe um Steam ID numérico válido.')
-      return
-    }
-
-    setLookupLoading(true)
-    setRecommendationError('')
-
-    try {
-      const userResult = await fetchUsersApi({
-        userId: uid,
-        baseUrl: apiUrl,
-      })
-
-      if (!userResult.users?.length) {
-        throw new Error(`A conta #${uid} não foi encontrada no banco de dados.`)
+      if (!Number.isSafeInteger(uid) || uid < 0) {
+        setRecommendationError('Informe um Steam ID numérico válido.')
+        return
       }
 
-      // A consulta de recomendações confirma se existe histórico utilizável.
-      await fetchUserRecommendationsApi(uid, {
-        topN,
-        excludeConsumed: true,
-        baseUrl: apiUrl,
-      })
+      setLookupLoading(true)
+      setRecommendationError('')
 
-      setSelectedUserId(uid)
-      setUserMetadata(userResult.users[0])
-      setUserType('existing')
-      setPageView('forYou')
-      setApiOnline(true)
-      setCustomUidInput('')
-    } catch (error) {
-      setRecommendationError(error.message)
-    } finally {
-      setLookupLoading(false)
-    }
-  }
+      try {
+        const userResult = await fetchUsersApi({
+          userId: uid,
+          baseUrl: apiUrl,
+        })
 
-  function handleToggleNewUserTag(tag) {
+        if (!userResult.users?.length) {
+          throw new Error(`A conta #${uid} não foi encontrada no banco de dados.`)
+        }
+
+        // A consulta de recomendações confirma se existe histórico utilizável
+        // e já armazena o resultado para evitar uma segunda chamada idêntica no useEffect.
+        const recResult = await fetchUserRecommendationsApi(uid, {
+          topN,
+          excludeConsumed: true,
+          baseUrl: apiUrl,
+        })
+
+        prefetchedUserRecRef.current = {
+          userId: uid,
+          topN,
+          result: recResult,
+        }
+
+        if (Number(selectedUserId) === uid && userType === 'existing') {
+          prefetchedUserRecRef.current = null
+          setProfileSummary(normalizeProfile(recResult.payload.profile))
+          setRecommendations((recResult.rawList || []).map(normalizeRecommendation))
+        }
+
+        setSelectedUserId(uid)
+        setUserMetadata(userResult.users[0])
+        setUserType('existing')
+        setPageView('forYou')
+        setApiOnline(true)
+        if (onSuccessClear) onSuccessClear()
+      } catch (error) {
+        setRecommendationError(error.message)
+      } finally {
+        setLookupLoading(false)
+      }
+    },
+    [apiUrl, topN, selectedUserId, userType]
+  )
+
+  const handleToggleNewUserTag = useCallback((tag) => {
     setNewUserTags((previous) =>
       previous.includes(tag)
         ? previous.filter((item) => item !== tag)
         : [...previous, tag]
     )
-  }
+  }, [])
 
-  function handleAddRefGameToNewUser(appId) {
-    const id = Number(appId)
+  const handleAddRefGameToNewUser = useCallback(
+    (appId, gameObj = null) => {
+      const id = Number(appId)
 
-    if (!Number.isSafeInteger(id) || id <= 0) return
-    if (newUserRefGames.some((item) => Number(item.app_id) === id)) return
+      if (!Number.isSafeInteger(id) || id <= 0) return
 
-    if (newUserRefGames.length >= 20) {
-      setRecommendationError('O cold-start permite no máximo 20 jogos de referência.')
-      return
-    }
+      if (gameObj) {
+        setKnownGamesById((prev) => {
+          if (prev.has(id)) return prev
+          const next = new Map(prev)
+          next.set(id, gameObj)
+          return next
+        })
+      }
 
-    setNewUserRefGames((previous) => [
-      ...previous,
-      { app_id: id, is_recommended: true },
-    ])
+      setNewUserRefGames((previous) => {
+        if (previous.some((item) => Number(item.app_id) === id)) {
+          return previous
+        }
+        if (previous.length >= 20) {
+          setRecommendationError(
+            'O cold-start permite no máximo 20 jogos de referência.'
+          )
+          return previous
+        }
+        setRecommendationError('')
+        return [...previous, { app_id: id, is_recommended: true }]
+      })
+    },
+    []
+  )
 
-    setSelectedAddGameId('')
-    setRecommendationError('')
-  }
+  const handleSelectGameFromCatalog = useCallback(
+    (game) => {
+      handleAddRefGameToNewUser(game.app_id, game)
+      setUserType('new')
+      setPageView('forYou')
+    },
+    [handleAddRefGameToNewUser]
+  )
 
-  function handleRemoveNewUserRefGame(appId) {
+  const handleRemoveNewUserRefGame = useCallback((appId) => {
     setNewUserRefGames((previous) =>
       previous.filter((item) => Number(item.app_id) !== Number(appId))
     )
-  }
+  }, [])
 
-  function handleSelectExistingUser(userId) {
+  const handleSelectExistingUser = useCallback((userId) => {
     setSelectedUserId(Number(userId))
     setUserMetadata(null)
     setRecommendationError('')
-  }
-
-  const existingPresetIds = REAL_STEAM_USERS.map((user) =>
-    Number(user.user_id)
-  )
+  }, [])
 
   return (
     <ThemeProvider theme={steamDarkTheme}>
@@ -803,7 +1617,7 @@ function App() {
                             handleSelectExistingUser(event.target.value)
                           }
                         >
-                          {!existingPresetIds.includes(Number(selectedUserId)) && (
+                          {!EXISTING_PRESET_IDS.includes(Number(selectedUserId)) && (
                             <MenuItem value={selectedUserId}>
                               Usuário #{selectedUserId}
                             </MenuItem>
@@ -822,34 +1636,10 @@ function App() {
                     </Grid>
 
                     <Grid size={{ xs: 12, sm: 5, md: 3 }}>
-                      <Box
-                        component="form"
-                        onSubmit={handleLookupSteamId}
-                        sx={{ display: 'flex', gap: 1 }}
-                      >
-                        <TextField
-                          fullWidth
-                          size="small"
-                          placeholder="Buscar por Steam ID..."
-                          value={customUidInput}
-                          onChange={(event) =>
-                            setCustomUidInput(event.target.value)
-                          }
-                        />
-
-                        <Button
-                          type="submit"
-                          variant="outlined"
-                          size="small"
-                          disabled={lookupLoading}
-                        >
-                          {lookupLoading ? (
-                            <CircularProgress size={18} />
-                          ) : (
-                            'Carregar'
-                          )}
-                        </Button>
-                      </Box>
+                      <SteamIdLookupForm
+                        onLookup={handleLookupSteamId}
+                        loading={lookupLoading}
+                      />
                     </Grid>
                   </Grid>
                 ) : (
@@ -937,58 +1727,20 @@ function App() {
                         2. Opcional — Marque jogos específicos que chamaram sua atenção:
                       </Typography>
 
-                      <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
-                        <FormControl fullWidth size="small">
-                          <InputLabel id="new-user-add-game">
-                            Selecionar um título de referência...
-                          </InputLabel>
-
-                          <Select
-                            labelId="new-user-add-game"
-                            label="Selecionar um título de referência..."
-                            value={selectedAddGameId}
-                            onChange={(event) =>
-                              setSelectedAddGameId(event.target.value)
-                            }
-                          >
-                            {availableGamesToPick.map((game) => (
-                              <MenuItem
-                                key={game.app_id}
-                                value={String(game.app_id)}
-                              >
-                                {game.title} ({(game.tags || []).slice(0, 2).join(', ')})
-                              </MenuItem>
-                            ))}
-                          </Select>
-                        </FormControl>
-
-                        <Button
-                          variant="contained"
-                          color="primary"
-                          size="small"
-                          startIcon={<AddIcon />}
-                          disabled={!selectedAddGameId}
-                          onClick={() =>
-                            handleAddRefGameToNewUser(selectedAddGameId)
-                          }
-                          sx={{
-                            px: 2,
-                            py: 0.9,
-                            whiteSpace: 'nowrap',
-                            flexShrink: 0,
-                          }}
-                        >
-                          Marcar interesse
-                        </Button>
-                      </Box>
+                      <ReferenceGamePicker
+                        availableGames={availableGamesToPick}
+                        selectedIds={newUserRefIdSet}
+                        apiUrl={apiUrl}
+                        onAddGame={handleAddRefGameToNewUser}
+                      />
 
                       <Typography
                         variant="caption"
                         color="text.secondary"
                         sx={{ display: 'block', mt: 0.75 }}
                       >
-                        A lista apresenta os jogos carregados do catálogo. Você
-                        também pode pesquisar outros títulos em Explorar Catálogo.
+                        O menu exibe inicialmente os jogos carregados do catálogo
+                        e busca em todo o catálogo conforme você digita.
                       </Typography>
                     </Box>
                   </Stack>
@@ -1034,7 +1786,8 @@ function App() {
                           </Typography>
                         </Stack>
 
-                        {recommendationLoading ? (
+                        {recommendationLoading &&
+                        profileSummary.historyWithWeight.length === 0 ? (
                           <Box sx={{ py: 3, textAlign: 'center' }}>
                             <CircularProgress size={24} />
                             <Typography
@@ -1045,78 +1798,11 @@ function App() {
                               Carregando histórico...
                             </Typography>
                           </Box>
-                        ) : profileSummary.historyWithWeight.length === 0 ? (
-                          <Typography variant="body2" color="text.secondary">
-                            Nenhum histórico disponível para este usuário.
-                          </Typography>
                         ) : (
-                          <Stack spacing={1.25}>
-                            {profileSummary.historyWithWeight.map((item) => (
-                              <Paper
-                                key={item.app_id}
-                                sx={{
-                                  p: 1.25,
-                                  bgcolor: '#121a24',
-                                  display: 'flex',
-                                  alignItems: 'center',
-                                  gap: 1.5,
-                                }}
-                              >
-                                <Box
-                                  sx={{
-                                    width: 84,
-                                    height: 40,
-                                    flexShrink: 0,
-                                  }}
-                                >
-                                  <GameCover
-                                    appId={item.app_id}
-                                    title={item.game?.title || ''}
-                                  />
-                                </Box>
-
-                                <Box sx={{ flex: 1, minWidth: 0 }}>
-                                  <Typography
-                                    variant="body2"
-                                    sx={{ fontWeight: 600 }}
-                                    noWrap
-                                  >
-                                    {item.game?.title || `App #${item.app_id}`}
-                                  </Typography>
-
-                                  <Stack
-                                    direction="row"
-                                    spacing={1}
-                                    sx={{ alignItems: 'center', mt: 0.25 }}
-                                  >
-                                    <Typography
-                                      variant="caption"
-                                      color="text.secondary"
-                                    >
-                                      {formatNumber(item.hours, 1)}h jogadas
-                                    </Typography>
-
-                                    <Chip
-                                      label={
-                                        item.is_recommended
-                                          ? 'Recomendou'
-                                          : 'Não recomendou'
-                                      }
-                                      size="small"
-                                      color={
-                                        item.is_recommended ? 'default' : 'error'
-                                      }
-                                      variant="outlined"
-                                      sx={{
-                                        height: 18,
-                                        fontSize: '0.66rem',
-                                      }}
-                                    />
-                                  </Stack>
-                                </Box>
-                              </Paper>
-                            ))}
-                          </Stack>
+                          <UserHistoryList
+                            key={selectedUserId}
+                            history={profileSummary.historyWithWeight}
+                          />
                         )}
                       </Paper>
 
@@ -1153,13 +1839,13 @@ function App() {
                                     color="text.secondary"
                                     sx={{ fontFamily: 'monospace' }}
                                   >
-                                    {(tag.weight * 100).toFixed(0)}%
+                                    {tagRelativePct(tag.weight, profileSummary.topTags)}%
                                   </Typography>
                                 </Stack>
 
                                 <LinearProgress
                                   variant="determinate"
-                                  value={Math.min(100, tag.weight * 100)}
+                                  value={tagRelativePct(tag.weight, profileSummary.topTags)}
                                   color="primary"
                                   sx={{ height: 6, borderRadius: 3 }}
                                 />
@@ -1232,7 +1918,7 @@ function App() {
 
                               <Stack spacing={1}>
                                 {newUserRefGames.map((item) => {
-                                  const game = catalogGamesById.get(
+                                  const game = knownGamesById.get(
                                     Number(item.app_id)
                                   )
 
@@ -1331,6 +2017,10 @@ function App() {
                             flexWrap: 'wrap',
                           }}
                         >
+                          {recommendationLoading && recommendations.length > 0 && (
+                            <CircularProgress size={18} />
+                          )}
+
                           <ToggleButtonGroup
                             size="small"
                             value={topN}
@@ -1347,7 +2037,7 @@ function App() {
                       </Box>
                     </Paper>
 
-                    {recommendationLoading ? (
+                    {recommendationLoading && recommendations.length === 0 ? (
                       <Paper sx={{ p: 6, textAlign: 'center' }}>
                         <CircularProgress size={32} />
 
@@ -1393,181 +2083,22 @@ function App() {
                         </Typography>
                       </Paper>
                     ) : (
-                      recommendations.map((rec) => {
-                        const game = rec.game
-                        const explanation = rec.explanation
-
-                        return (
-                          <Card key={rec.app_id} sx={{ overflow: 'hidden' }}>
-                            <Grid container>
-                              <Grid size={{ xs: 12, sm: 4, md: 3.6 }}>
-                                <Box
-                                  sx={{
-                                    height: { xs: 165, sm: '100%' },
-                                    minHeight: 145,
-                                  }}
-                                >
-                                  <GameCover
-                                    appId={rec.app_id}
-                                    title={game.title}
-                                    borderRadius={0}
-                                  />
-                                </Box>
-                              </Grid>
-
-                              <Grid size={{ xs: 12, sm: 8, md: 8.4 }}>
-                                <Box sx={{ p: 2.5 }}>
-                                  <Stack
-                                    direction="row"
-                                    spacing={1.5}
-                                    sx={{
-                                      justifyContent: 'space-between',
-                                      alignItems: 'flex-start',
-                                    }}
-                                  >
-                                    <Box sx={{ minWidth: 0 }}>
-                                      <Typography
-                                        variant="h6"
-                                        sx={{
-                                          fontSize: '1.05rem',
-                                          fontWeight: 700,
-                                        }}
-                                      >
-                                        {game.title}
-                                      </Typography>
-
-                                      <Typography
-                                        variant="caption"
-                                        color="text.secondary"
-                                      >
-                                        Avaliações: {game.rating || 'N/D'} (
-                                        {game.positive_ratio ?? 'N/D'}%) ·
-                                        Lançamento: {game.date_release || 'N/D'} ·{' '}
-                                        {formatPrice(game.price_final)}
-                                      </Typography>
-                                    </Box>
-
-                                    <Chip
-                                      label={`${(rec.similarity * 100).toFixed(0)}% compatível`}
-                                      color="secondary"
-                                      size="small"
-                                      sx={{
-                                        fontWeight: 700,
-                                        flexShrink: 0,
-                                      }}
-                                    />
-                                  </Stack>
-
-                                  <Typography
-                                    variant="body2"
-                                    color="text.secondary"
-                                    sx={{
-                                      mt: 1,
-                                      mb: 1.75,
-                                      display: '-webkit-box',
-                                      WebkitLineClamp: 2,
-                                      WebkitBoxOrient: 'vertical',
-                                      overflow: 'hidden',
-                                    }}
-                                  >
-                                    {game.description || 'Descrição indisponível.'}
-                                  </Typography>
-
-                                  <Paper
-                                    sx={{
-                                      p: 1.5,
-                                      bgcolor: '#111923',
-                                      borderColor: 'rgba(102, 192, 244, 0.14)',
-                                    }}
-                                  >
-                                    <Box
-                                      sx={{
-                                        display: 'flex',
-                                        justifyContent: 'space-between',
-                                        alignItems: 'center',
-                                        flexWrap: 'wrap',
-                                        gap: 1,
-                                        mb: 1,
-                                      }}
-                                    >
-                                      {userType === 'existing' &&
-                                      explanation.mostSimilarConsumed ? (
-                                        <Typography
-                                          variant="caption"
-                                          color="text.primary"
-                                        >
-                                          Recomendado porque você jogou{' '}
-                                          <Box
-                                            component="span"
-                                            sx={{
-                                              color: 'primary.main',
-                                              fontWeight: 600,
-                                            }}
-                                          >
-                                            {explanation.mostSimilarConsumed.title}
-                                          </Box>{' '}
-                                          ({formatNumber(
-                                            explanation.mostSimilarConsumed.hours,
-                                            1
-                                          )}h)
-                                        </Typography>
-                                      ) : (
-                                        <Typography
-                                          variant="caption"
-                                          color="text.primary"
-                                        >
-                                          {userType === 'new'
-                                            ? 'Combina com suas preferências iniciais:'
-                                            : 'Compatível com seu perfil de jogador:'}
-                                        </Typography>
-                                      )}
-
-                                      <Button
-                                        size="small"
-                                        variant="text"
-                                        startIcon={
-                                          <InfoOutlinedIcon fontSize="small" />
-                                        }
-                                        onClick={() => setInspectedRec(rec)}
-                                        sx={{
-                                          py: 0,
-                                          fontSize: '0.74rem',
-                                        }}
-                                      >
-                                        Por que combina comigo?
-                                      </Button>
-                                    </Box>
-
-                                    <Box
-                                      sx={{
-                                        display: 'flex',
-                                        flexWrap: 'wrap',
-                                        gap: 0.75,
-                                      }}
-                                    >
-                                      {explanation.matchedTags
-                                        .slice(0, 5)
-                                        .map((tag) => (
-                                          <Chip
-                                            key={tag.tag}
-                                            label={tag.tag}
-                                            size="small"
-                                            color="primary"
-                                            variant="outlined"
-                                            sx={{
-                                              height: 22,
-                                              fontSize: '0.72rem',
-                                            }}
-                                          />
-                                        ))}
-                                    </Box>
-                                  </Paper>
-                                </Box>
-                              </Grid>
-                            </Grid>
-                          </Card>
-                        )
-                      })
+                      <Stack
+                        spacing={2}
+                        sx={{
+                          opacity: recommendationLoading ? 0.65 : 1,
+                          transition: 'opacity 150ms ease',
+                        }}
+                      >
+                        {recommendations.map((rec) => (
+                          <RecommendationCard
+                            key={rec.app_id}
+                            rec={rec}
+                            userType={userType}
+                            onInspect={setInspectedRec}
+                          />
+                        ))}
+                      </Stack>
                     )}
                   </Stack>
                 </Grid>
@@ -1576,56 +2107,15 @@ function App() {
           ) : (
             /* Explorar catálogo */
             <Stack spacing={3}>
-              <Paper sx={{ p: 2.5 }}>
-                <Grid container spacing={2} sx={{ alignItems: 'center' }}>
-                  <Grid size={{ xs: 12, md: 6 }}>
-                    <TextField
-                      fullWidth
-                      size="small"
-                      label="Buscar jogo pelo nome ou tema"
-                      value={catalogSearch}
-                      onChange={(event) =>
-                        setCatalogSearch(event.target.value)
-                      }
-                    />
-                  </Grid>
-
-                  <Grid size={{ xs: 12, sm: 6, md: 4 }}>
-                    <FormControl fullWidth size="small">
-                      <InputLabel id="tag-filter-label">
-                        Filtrar por Gênero / Tag
-                      </InputLabel>
-
-                      <Select
-                        labelId="tag-filter-label"
-                        label="Filtrar por Gênero / Tag"
-                        value={catalogTagFilter}
-                        onChange={(event) =>
-                          setCatalogTagFilter(event.target.value)
-                        }
-                      >
-                        <MenuItem value="ALL">
-                          Todos os Gêneros ({allCatalogTags.length})
-                        </MenuItem>
-
-                        {allCatalogTags.map((tag) => (
-                          <MenuItem key={tag} value={tag}>
-                            {tag}
-                          </MenuItem>
-                        ))}
-                      </Select>
-                    </FormControl>
-                  </Grid>
-
-                  <Grid size={{ xs: 12, sm: 6, md: 2 }}>
-                    <Typography variant="caption" color="text.secondary">
-                      {catalogLoading
-                        ? 'Buscando...'
-                        : `${formatNumber(catalogTotal)} jogos encontrados`}
-                    </Typography>
-                  </Grid>
-                </Grid>
-              </Paper>
+              <CatalogFilterBar
+                initialSearch={catalogSearch}
+                onSearchChange={setCatalogSearch}
+                tagFilter={catalogTagFilter}
+                onTagFilterChange={setCatalogTagFilter}
+                allCatalogTags={allCatalogTags}
+                catalogLoading={catalogLoading}
+                catalogTotal={catalogTotal}
+              />
 
               {catalogError && (
                 <Paper
@@ -1642,7 +2132,7 @@ function App() {
                 </Paper>
               )}
 
-              {catalogLoading ? (
+              {catalogLoading && catalogGames.length === 0 ? (
                 <Box sx={{ py: 6, textAlign: 'center' }}>
                   <CircularProgress />
                   <Typography
@@ -1665,137 +2155,25 @@ function App() {
                 </Paper>
               ) : (
                 <>
-                  <Grid container spacing={2.5}>
-                    {catalogGames.map((game) => {
-                      const alreadySelected = newUserRefGames.some(
-                        (item) =>
-                          Number(item.app_id) === Number(game.app_id)
-                      )
-
-                      return (
-                        <Grid
-                          key={game.app_id}
-                          size={{ xs: 12, sm: 6, md: 4, lg: 3 }}
-                        >
-                          <Card
-                            sx={{
-                              height: '100%',
-                              display: 'flex',
-                              flexDirection: 'column',
-                              justifyContent: 'space-between',
-                            }}
-                          >
-                            <Box>
-                              <Box sx={{ height: 135 }}>
-                                <GameCover
-                                  appId={game.app_id}
-                                  title={game.title}
-                                  borderRadius={0}
-                                />
-                              </Box>
-
-                              <Box sx={{ p: 2 }}>
-                                <Stack
-                                  direction="row"
-                                  spacing={1}
-                                  sx={{
-                                    justifyContent: 'space-between',
-                                    alignItems: 'flex-start',
-                                  }}
-                                >
-                                  <Typography
-                                    variant="subtitle1"
-                                    sx={{ fontSize: '0.95rem' }}
-                                  >
-                                    {game.title}
-                                  </Typography>
-
-                                  <Typography
-                                    variant="caption"
-                                    sx={{
-                                      fontFamily: 'monospace',
-                                      color: 'secondary.main',
-                                      fontWeight: 600,
-                                      whiteSpace: 'nowrap',
-                                    }}
-                                  >
-                                    {game.price_final === 0
-                                      ? 'Gratuito'
-                                      : formatPrice(game.price_final)}
-                                  </Typography>
-                                </Stack>
-
-                                <Typography
-                                  variant="caption"
-                                  color="text.secondary"
-                                  sx={{ display: 'block', mb: 1 }}
-                                >
-                                  {game.rating || 'N/D'} (
-                                  {game.positive_ratio ?? 'N/D'}%)
-                                </Typography>
-
-                                <Typography
-                                  variant="body2"
-                                  color="text.secondary"
-                                  sx={{
-                                    mb: 1.5,
-                                    display: '-webkit-box',
-                                    WebkitLineClamp: 2,
-                                    WebkitBoxOrient: 'vertical',
-                                    overflow: 'hidden',
-                                  }}
-                                >
-                                  {game.description || 'Descrição indisponível.'}
-                                </Typography>
-
-                                <Box
-                                  sx={{
-                                    display: 'flex',
-                                    flexWrap: 'wrap',
-                                    gap: 0.5,
-                                  }}
-                                >
-                                  {(game.tags || []).slice(0, 4).map((tag) => (
-                                    <Chip
-                                      key={tag}
-                                      label={tag}
-                                      size="small"
-                                      sx={{
-                                        height: 20,
-                                        fontSize: '0.68rem',
-                                      }}
-                                    />
-                                  ))}
-                                </Box>
-                              </Box>
-                            </Box>
-
-                            <Box sx={{ px: 2, pb: 2 }}>
-                              <Button
-                                fullWidth
-                                size="small"
-                                variant={
-                                  alreadySelected ? 'contained' : 'outlined'
-                                }
-                                disabled={
-                                  alreadySelected ||
-                                  newUserRefGames.length >= 20
-                                }
-                                onClick={() => {
-                                  handleAddRefGameToNewUser(game.app_id)
-                                  setUserType('new')
-                                  setPageView('forYou')
-                                }}
-                              >
-                                {alreadySelected
-                                  ? 'Marcado como interesse'
-                                  : 'Tenho interesse neste jogo'}
-                              </Button>
-                            </Box>
-                          </Card>
-                        </Grid>
-                      )
-                    })}
+                  <Grid
+                    container
+                    spacing={2.5}
+                    sx={{
+                      opacity: catalogLoading ? 0.6 : 1,
+                      transition: 'opacity 150ms ease',
+                    }}
+                  >
+                    {catalogGames.map((game) => (
+                      <CatalogGameCard
+                        key={game.app_id}
+                        game={game}
+                        alreadySelected={newUserRefIdSet.has(
+                          Number(game.app_id)
+                        )}
+                        limitReached={newUserRefGames.length >= 20}
+                        onSelectGame={handleSelectGameFromCatalog}
+                      />
+                    ))}
                   </Grid>
 
                   {catalogHasMore && (
@@ -1957,6 +2335,13 @@ function App() {
                       </Paper>
                     </Grid>
                   </Grid>
+
+                  {inspectedRec.explanation.matchedTerms.length === 0 && (
+                    <Typography variant="caption" color="text.secondary">
+                      Nenhum termo de sinopse (TF-IDF) em comum: este jogo ou
+                      os jogos do seu histórico não têm descrição no dataset.
+                    </Typography>
+                  )}
 
                   <Table size="small">
                     <TableHead>

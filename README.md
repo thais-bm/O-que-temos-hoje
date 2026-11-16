@@ -25,7 +25,10 @@ similaridade do cosseno, com explicações das características combinadas.
 │   ├── results/          # evaluation_results.csv
 │   ├── RELATORIO_AVALIACAO.md   # Protocolo e resultados da avaliação
 │   └── uv.lock           # Lockfile do uv
-├── scripts/import_steam_db.py  # Importa dados brutos para o SQLite
+├── scripts/
+│   ├── import_steam_db.py # Importa dados brutos para o SQLite
+│   └── start_app.py       # Inicializa banco, backend e frontend juntos
+├── start.ps1             # Atalho PowerShell para scripts/start_app.py
 └── INSTRUCOES.md         # Requisitos e papéis do projeto
 ```
 
@@ -34,9 +37,33 @@ similaridade do cosseno, com explicações das características combinadas.
 ### Pré-requisitos
 
 - Python 3.10+
+- Node.js 18+ e npm
 - [uv](https://github.com/astral-sh/uv) (recomendado) ou pip/virtualenv
 
-### 1. Importar os dados para o SQLite
+### Opção A — Inicialização com um único comando (Recomendado)
+
+Na raiz do repositório, execute:
+
+```bash
+python scripts/start_app.py
+```
+
+Ou no PowerShell (Windows):
+
+```powershell
+.\start.ps1
+```
+
+O script:
+1. Verifica se `data/steam.db` existe (e, caso não exista, executa automaticamente `scripts/import_steam_db.py` a partir de `data/raw/`);
+2. Instala as dependências do `frontend/` (`npm install`) caso `node_modules` ainda não exista;
+3. Sobe o backend FastAPI (`http://localhost:8000`) e o frontend React (`http://localhost:5173`) no mesmo terminal (pressione `Ctrl+C` para encerrar ambos).
+
+---
+
+### Opção B — Inicialização manual (passo a passo)
+
+#### 1. Importar os dados para o SQLite
 
 ```bash
 python scripts/import_steam_db.py

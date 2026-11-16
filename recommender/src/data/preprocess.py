@@ -437,6 +437,7 @@ def build_user_profile(
     item_matrix: csr_matrix,
     app_ids: list[int],
     min_interactions: int = 1,
+    app_id_to_idx: dict[int, int] | None = None,
 ) -> tuple[csr_matrix | None, list[int]]:
     """Constrói um perfil equilibrado com preferências positivas e negativas.
 
@@ -476,17 +477,18 @@ def build_user_profile(
             "à quantidade de app_ids."
         )
 
-    app_id_to_idx = {}
+    if app_id_to_idx is None:
+        app_id_to_idx = {}
 
-    for idx, app_id in enumerate(app_ids):
-        normalized_id = int(app_id)
+        for idx, app_id in enumerate(app_ids):
+            normalized_id = int(app_id)
 
-        if normalized_id in app_id_to_idx:
-            raise ValueError(
-                f"app_id duplicado na matriz: {normalized_id}"
-            )
+            if normalized_id in app_id_to_idx:
+                raise ValueError(
+                    f"app_id duplicado na matriz: {normalized_id}"
+                )
 
-        app_id_to_idx[normalized_id] = idx
+            app_id_to_idx[normalized_id] = idx
 
     user_hist = recommendations[
         recommendations["user_id"] == user_id
@@ -500,9 +502,12 @@ def build_user_profile(
     positive_interactions: list[tuple[int, float]] = []
     negative_interactions: list[tuple[int, float]] = []
 
-    for _, row in user_hist.iterrows():
+    has_recommended_col = "is_recommended" in user_hist.columns
+    has_hours_col = "hours" in user_hist.columns
+
+    for row in user_hist.itertuples(index=False):
         try:
-            app_id = int(row["app_id"])
+            app_id = int(getattr(row, "app_id"))
         except (TypeError, ValueError, OverflowError):
             continue
 
@@ -513,13 +518,14 @@ def build_user_profile(
         if app_id not in app_id_to_idx:
             continue
 
-        recommended = _to_bool(
-            row.get("is_recommended", True),
-            default=True,
+        recommended = (
+            _to_bool(getattr(row, "is_recommended"), default=True)
+            if has_recommended_col
+            else True
         )
 
         magnitude = _interaction_weight(
-            row.get("hours", 0.0)
+            getattr(row, "hours", 0.0) if has_hours_col else 0.0
         )
 
         if recommended:

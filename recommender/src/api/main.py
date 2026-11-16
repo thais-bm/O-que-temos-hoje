@@ -224,6 +224,39 @@ def load_data_for_api(
     if not game_lookup:
         raise RuntimeError("Não foi possível construir o catálogo.")
 
+    # Índice em memória para consultas rápidas de catálogo (/games) e tags (/tags)
+    catalog_entries: list[dict[str, Any]] = []
+    catalog_by_tag: dict[str, list[dict[str, Any]]] = {}
+    unique_tags_by_lower: dict[str, str] = {}
+
+    for app_id in sorted(game_lookup.keys()):
+        serialized = game_lookup[app_id]
+        title_lower = (serialized.get("title") or "").lower()
+        desc_lower = (serialized.get("description") or "").lower()
+        tags_list = serialized.get("tags") or []
+        tags_lower = frozenset(t.lower() for t in tags_list if t and t.strip())
+
+        entry = {
+            "serialized": serialized,
+            "search_blob": f"{title_lower}\n{desc_lower}",
+            "tags_lower": tags_lower,
+        }
+        catalog_entries.append(entry)
+
+        for tag_str in tags_list:
+            cleaned_tag = tag_str.strip()
+            if not cleaned_tag:
+                continue
+            tag_key = cleaned_tag.lower()
+            if tag_key not in unique_tags_by_lower:
+                unique_tags_by_lower[tag_key] = tag_str
+            catalog_by_tag.setdefault(tag_key, []).append(entry)
+
+    catalog_tags = [
+        unique_tags_by_lower[k]
+        for k in sorted(unique_tags_by_lower.keys())
+    ]
+
     logger.info("Construindo matriz TF-IDF + Tags...")
     item_matrix, app_ids, features = build_item_vectors(
         games,
@@ -254,6 +287,9 @@ def load_data_for_api(
         "games": games,
         "metadata": metadata,
         "game_lookup": game_lookup,
+        "catalog_entries": catalog_entries,
+        "catalog_by_tag": catalog_by_tag,
+        "catalog_tags": catalog_tags,
         "recommender": recommender,
         "app_ids": app_ids,
         "db_path": db_path,
@@ -369,6 +405,40 @@ def get_games(
     search = search.strip() if search else None
     tag = tag.strip() if tag else None
 
+    catalog_entries: list[dict[str, Any]] | None = STATE.get("catalog_entries")
+    catalog_by_tag: dict[str, list[dict[str, Any]]] | None = STATE.get("catalog_by_tag")
+
+    if catalog_entries is not None and catalog_by_tag is not None:
+        base_pool = (
+            catalog_by_tag.get(tag.lower(), [])
+            if tag
+            else catalog_entries
+        )
+
+        if search:
+            term_lower = search.lower()
+            filtered = [
+                entry["serialized"]
+                for entry in base_pool
+                if term_lower in entry["search_blob"]
+            ]
+            total = len(filtered)
+            games = filtered[offset : offset + limit]
+        else:
+            total = len(base_pool)
+            games = [
+                entry["serialized"]
+                for entry in base_pool[offset : offset + limit]
+            ]
+
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(games) < total,
+            "games": games,
+        }
+
     try:
         total = count_games_filtered(
             search=search,
@@ -417,6 +487,13 @@ def get_tags() -> dict[str, Any]:
             status_code=503,
             detail="Catálogo temporariamente indisponível.",
         )
+
+    cached_tags: list[str] | None = STATE.get("catalog_tags")
+    if cached_tags is not None:
+        return {
+            "total": len(cached_tags),
+            "tags": cached_tags,
+        }
 
     try:
         tags = load_catalog_tags(db_path=db_path)
@@ -534,13 +611,29 @@ def search_users(
         ) from error
 
 
-def _build_profile_response(profile_data: dict) -> UserProfileSummary:
+def _build_profile_response(
+    profile_data: dict,
+    game_lookup: dict[int, dict[str, Any]],
+) -> UserProfileSummary:
     """Converte o resumo do perfil do recomendador para o schema da API."""
 
-    history = [
-        HistoryInteraction(**item)
-        for item in profile_data.get("history_with_weight", [])
-    ]
+    history = []
+
+    for item in profile_data.get("history_with_weight", []):
+        app_id = int(item["app_id"])
+        game_data = game_lookup.get(app_id)
+        title = (
+            game_data.get("title")
+            if game_data is not None
+            else f"Jogo {app_id}"
+        )
+
+        history.append(
+            HistoryInteraction(
+                **item,
+                title=title,
+            )
+        )
 
     top_tags = [
         ProfileFeature(**item)
@@ -790,7 +883,10 @@ def get_user_recommendations(
         )
 
     profile_data = detailed_results[0].get("profile", {})
-    profile_response = _build_profile_response(profile_data)
+    profile_response = _build_profile_response(
+        profile_data,
+        game_lookup,
+    )
 
     complete_recommendations = []
 

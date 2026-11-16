@@ -18,6 +18,7 @@ import pandas as pd
 
 from scipy.sparse import csr_matrix
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import normalize
 
 from ..data.preprocess import build_user_profile
 
@@ -44,8 +45,31 @@ class ContentBasedRecommender:
             )
 
         self.item_matrix = item_matrix.tocsr()
+        self._item_matrix_normalized = normalize(
+            self.item_matrix.astype(np.float64),
+            norm="l2",
+            axis=1,
+            copy=True,
+        )
         self.app_ids = [int(aid) for aid in app_ids]
         self.features = list(features)
+
+        # Jogos sem descrição ficam com vetor só de tags/numéricos. Como o
+        # cosseno normaliza pelo vetor inteiro, eles ganhavam vantagem sobre
+        # jogos com descrição (cujo bloco TF-IDF divide a norma). Tratamos o
+        # texto ausente como um bloco TF-IDF ortogonal ao perfil (similaridade
+        # textual zero): o cosseno cai por 1/sqrt(2), o que equaliza os dois.
+        tfidf_cols = [
+            idx for idx, feature in enumerate(self.features)
+            if feature.startswith("tfidf::")
+        ]
+        if tfidf_cols:
+            has_text = (
+                self.item_matrix[:, tfidf_cols].getnnz(axis=1) > 0
+            )
+            self._text_scale = np.where(has_text, 1.0, 1.0 / np.sqrt(2.0))
+        else:
+            self._text_scale = np.ones(self.item_matrix.shape[0])
 
         if len(set(self.app_ids)) != len(self.app_ids):
             raise ValueError("Existem app_ids duplicados na matriz.")
@@ -711,10 +735,11 @@ class ContentBasedRecommender:
         }
 
         # Calcula similaridade entre o perfil e o catálogo.
-        similarities = cosine_similarity(
-            profile,
-            self.item_matrix,
-        ).ravel()
+        similarities = (
+            self._item_matrix_normalized.dot(profile.T)
+            .toarray()
+            .ravel()
+        ) * self._text_scale
 
         similarities = np.nan_to_num(
             similarities,
@@ -732,16 +757,13 @@ class ContentBasedRecommender:
         if reference_indices:
             similarities[reference_indices] = -np.inf
 
-        ranked_indices = np.argsort(
-            -similarities,
-            kind="stable",
-        )
-
-        ranked_indices = [
-            int(idx)
-            for idx in ranked_indices
-            if np.isfinite(similarities[idx])
-        ][:int(top_n)]
+        top_n_int = int(top_n)
+        ranked_indices = []
+        for idx in np.argsort(-similarities, kind="stable"):
+            if np.isfinite(similarities[idx]):
+                ranked_indices.append(int(idx))
+                if len(ranked_indices) >= top_n_int:
+                    break
 
         detailed_results = []
 
@@ -815,6 +837,7 @@ class ContentBasedRecommender:
             recommendations,
             self.item_matrix,
             self.app_ids,
+            app_id_to_idx=self._app_id_to_idx,
         )
 
         if profile is None:
@@ -832,10 +855,17 @@ class ContentBasedRecommender:
             valid_history,
         )
 
-        similarities = cosine_similarity(
-            profile,
-            self.item_matrix,
-        ).ravel()
+        profile_norm = normalize(
+            profile.astype(np.float64),
+            norm="l2",
+            axis=1,
+            copy=True,
+        )
+        similarities = (
+            self._item_matrix_normalized.dot(profile_norm.T)
+            .toarray()
+            .ravel()
+        ) * self._text_scale
 
         similarities = np.nan_to_num(
             similarities,
@@ -853,16 +883,13 @@ class ContentBasedRecommender:
 
             similarities[consumed_indices] = -np.inf
 
-        ranked_indices = np.argsort(
-            -similarities,
-            kind="stable",
-        )
-
-        ranked_indices = [
-            int(idx)
-            for idx in ranked_indices
-            if np.isfinite(similarities[idx])
-        ][:int(top_n)]
+        top_n_int = int(top_n)
+        ranked_indices = []
+        for idx in np.argsort(-similarities, kind="stable"):
+            if np.isfinite(similarities[idx]):
+                ranked_indices.append(int(idx))
+                if len(ranked_indices) >= top_n_int:
+                    break
 
         if not ranked_indices:
             return []
